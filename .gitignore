@@ -2,3 +2,5 @@
 __pycache__/
 .env
 garena_account_tool*.py
+*.db
+*.pkl
