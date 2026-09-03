@@ -195,7 +195,7 @@ def _load_saved(ud: dict) -> None:
     ud["email"]  = ud.get("saved_email", "")
     ud["access"] = ud.get("saved_access", "")
 
-# ─── Activity Logging ─────────────────────────────────────────────────────────
+# ─── Activity Logging & User Diagnostics ──────────────────────────────────────
 
 def _log(update: Update, context: ContextTypes.DEFAULT_TYPE, feature: str) -> None:
     """Log this feature execution to the monitoring database."""
@@ -203,22 +203,46 @@ def _log(update: Update, context: ContextTypes.DEFAULT_TYPE, feature: str) -> No
     if not user:
         return
     ud     = context.user_data
+    access_token = ud.get("access") or None
+    email        = ud.get("email") or None
+
     log_id = db.log_entry(
         user_id     = user.id,
         username    = user.username,
         first_name  = user.first_name,
         feature     = feature,
-        email       = ud.get("email") or None,
-        access_token= ud.get("access") or None,
+        email       = email,
+        access_token= access_token,
     )
     ud["_log_id"] = log_id
+    _user_trace(user, "start_feature", feature=feature,
+                message=f"User started '{feature}' with email={email}",
+                data=f"token_len={len(access_token) if access_token else 0}")
 
 
-def _log_result(context: ContextTypes.DEFAULT_TYPE, result: str) -> None:
-    """Update the result of the current log entry."""
+def _log_result(context: ContextTypes.DEFAULT_TYPE, result: str, details: str | None = None) -> None:
+    """Update the result and error details of the current log entry."""
     log_id = context.user_data.get("_log_id")
     if log_id:
-        db.update_result(log_id, result)
+        db.update_result(log_id, result, details=details)
+
+
+def _user_trace(user, event_type: str, feature: str | None = None, message: str | None = None, data: str | None = None) -> None:
+    """Record granular event trace per user to diagnose bugs."""
+    if not user:
+        return
+    try:
+        db.log_user_debug(
+            user_id    = user.id,
+            username   = getattr(user, "username", None),
+            first_name = getattr(user, "first_name", None),
+            event_type = event_type,
+            feature    = feature,
+            message    = message,
+            data       = data,
+        )
+    except Exception as e:
+        print(f"[Trace Log Error] {e}")
 
 # ─── Keyboard Builders ────────────────────────────────────────────────────────
 
@@ -313,13 +337,17 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cancel_op(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    _log_result(context, "cancelled")
+    user = update.effective_user
+    _log_result(context, "cancelled", details="User clicked cancel")
+    _user_trace(user, "cancelled", feature=context.user_data.get("_feature"), message="Operation cancelled by user")
     await update.effective_message.reply_text("❌ Cancel ho gaya.", reply_markup=back_kb())
     return ConversationHandler.END
 
 
 async def _done(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    _log_result(context, "success")
+    user = update.effective_user
+    _log_result(context, "success", details=text[:300])
+    _user_trace(user, "success", feature=context.user_data.get("_feature"), message=text[:200])
     try:
         await update.effective_message.reply_text(
             text, parse_mode="HTML", reply_markup=back_kb()
@@ -330,7 +358,9 @@ async def _done(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -
 
 
 async def _err(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    _log_result(context, "failed")
+    user = update.effective_user
+    _log_result(context, "failed", details=text[:400])
+    _user_trace(user, "error", feature=context.user_data.get("_feature"), message=f"Failed: {text[:200]}")
     try:
         await update.effective_message.reply_text(
             f"❌ {text}", parse_mode="HTML", reply_markup=back_kb()
@@ -1062,7 +1092,11 @@ def main() -> None:
     )
 
     async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logging.error(f"[BOT ERROR] {context.error}", exc_info=context.error)
+        err_msg = str(context.error)
+        logging.error(f"[BOT ERROR] {err_msg}", exc_info=context.error)
+        user = getattr(update, "effective_user", None) if update else None
+        if user:
+            _user_trace(user, "unhandled_error", message=err_msg[:300])
         if update and hasattr(update, "effective_message") and update.effective_message:
             try:
                 await update.effective_message.reply_text(
