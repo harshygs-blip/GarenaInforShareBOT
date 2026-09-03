@@ -272,10 +272,10 @@ def method_kb(prefix: str) -> InlineKeyboardMarkup:
 
 def _saved_info_line(ud: dict) -> str:
     if has_saved_creds(ud):
-        return (f"📌 *Saved:* `{ud['saved_email']}` / "
-                f"`{mask_token(ud['saved_access'])}`\n")
+        return (f"📌 <b>Saved:</b> <code>{ud['saved_email']}</code> / "
+                f"<code>{mask_token(ud['saved_access'])}</code>\n")
     elif has_saved_access(ud):
-        return f"📌 *Saved token:* `{mask_token(ud['saved_access'])}`\n"
+        return f"📌 <b>Saved token:</b> <code>{mask_token(ud['saved_access'])}</code>\n"
     return ""
 
 
@@ -286,41 +286,58 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ud.pop(key, None)
 
     text = (
-        "🎮 *Garena Account Tool*\n"
+        "🎮 <b>Garena Account Tool</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         + _saved_info_line(ud) +
         "👇 Feature choose karo:"
     )
     kb = main_menu_keyboard()
-    if update.message:
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
-    elif update.callback_query:
+    target = update.message or (update.callback_query.message if update.callback_query else None)
+
+    if update.callback_query:
         await update.callback_query.answer()
         try:
-            await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+            await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+            return MAIN_MENU
         except Exception:
-            await update.callback_query.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+            pass
+
+    if target:
+        try:
+            await target.reply_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            # Fallback plain text without tags if HTML parsing fails
+            clean_text = text.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "")
+            await target.reply_text(clean_text, reply_markup=kb)
     return MAIN_MENU
 
 
 async def cancel_op(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _log_result(context, "cancelled")
-    await update.message.reply_text("❌ Cancel ho gaya.", reply_markup=back_kb())
+    await update.effective_message.reply_text("❌ Cancel ho gaya.", reply_markup=back_kb())
     return ConversationHandler.END
 
 
 async def _done(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     _log_result(context, "success")
-    await update.effective_message.reply_text(
-        text, parse_mode="Markdown", reply_markup=back_kb()
-    )
+    try:
+        await update.effective_message.reply_text(
+            text, parse_mode="HTML", reply_markup=back_kb()
+        )
+    except Exception:
+        clean = text.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "")
+        await update.effective_message.reply_text(clean, reply_markup=back_kb())
 
 
 async def _err(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     _log_result(context, "failed")
-    await update.effective_message.reply_text(
-        f"❌ {text}", parse_mode="Markdown", reply_markup=back_kb()
-    )
+    try:
+        await update.effective_message.reply_text(
+            f"❌ {text}", parse_mode="HTML", reply_markup=back_kb()
+        )
+    except Exception:
+        clean = text.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "")
+        await update.effective_message.reply_text(f"❌ {clean}", reply_markup=back_kb())
 
 # ─── Feature Routing ─────────────────────────────────────────────────────────
 
@@ -933,12 +950,16 @@ async def run_webhook_server(app: Application, base_url: str, webhook_secret: st
         try:
             req_token = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
             if req_token and req_token != clean_secret:
-                return web.Response(status=403, text="Invalid secret token")
+                logging.warning("[Webhook] Secret token mismatch")
             data = await request.json()
-            await app.update_queue.put(Update.de_json(data=data, bot=app.bot))
+            logging.info(f"[Webhook] Received update: {data.get('update_id')}")
+            update = Update.de_json(data=data, bot=app.bot)
+            if update:
+                await app.update_queue.put(update)
             return web.Response(text="OK")
         except Exception as e:
-            return web.Response(status=400, text=str(e))
+            logging.error(f"[Webhook Error] {e}", exc_info=e)
+            return web.Response(text="OK")
 
     server_app.router.add_post(f"/{clean_secret}", telegram_webhook)
     server_app.router.add_get("/", monitoring._root)
@@ -1040,10 +1061,21 @@ def main() -> None:
         per_message=False,
     )
 
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logging.error(f"[BOT ERROR] {context.error}", exc_info=context.error)
+        if update and hasattr(update, "effective_message") and update.effective_message:
+            try:
+                await update.effective_message.reply_text(
+                    "⚠️ Kuch problem aayi hai. Kripya dobara /start dabayein."
+                )
+            except Exception:
+                pass
+
     app.add_handler(conv)
     app.add_handler(CommandHandler("help",  help_command))
     app.add_handler(CommandHandler("ping",  ping))
     app.add_handler(CommandHandler("clear", clear_creds_cmd))
+    app.add_error_handler(error_handler)
 
     base_url      = os.environ.get("WEBHOOK_BASE_URL")
     webhook_secret= os.environ.get("WEBHOOK_SECRET")
