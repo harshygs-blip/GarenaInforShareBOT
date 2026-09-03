@@ -3,8 +3,13 @@
 import logging
 import os
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
 
 
 logging.basicConfig(
@@ -16,13 +21,48 @@ logging.basicConfig(
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Reply when the user starts a chat with the bot."""
     if update.message:
-        await update.message.reply_text("Hello! Main aapka Telegram bot hoon. /help bhejo.")
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Help", callback_data="help")],
+                [InlineKeyboardButton("About", callback_data="about")],
+            ]
+        )
+        await update.message.reply_text(
+            "Hello! Main GarenShareinfo bot hoon. Neeche option select karo.",
+            reply_markup=keyboard,
+        )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show the currently available commands."""
     if update.message:
         await update.message.reply_text("Available commands:\n/start - Bot shuru karo\n/help - Help dekho")
+
+
+async def about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Describe the bot's currently available purpose."""
+    if update.message:
+        await update.message.reply_text("GarenShareinfo ek simple information and support bot hai.")
+
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Confirm that the bot is running."""
+    if update.message:
+        await update.message.reply_text("Bot online hai.")
+
+
+async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the safe information buttons shown by /start."""
+    query = update.callback_query
+    if not query:
+        return
+
+    await query.answer()
+    responses = {
+        "help": "Commands:\n/start - Main menu\n/help - Help\n/about - Bot ke baare mein\n/ping - Bot status",
+        "about": "GarenShareinfo ek simple information and support bot hai.",
+    }
+    await query.message.reply_text(responses.get(query.data, "Option available nahi hai."))
 
 
 def main() -> None:
@@ -38,6 +78,9 @@ def main() -> None:
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("about", about))
+    app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(CallbackQueryHandler(button_click))
 
     port = int(os.environ.get("PORT", "8000"))
     webhook_url = f"{base_url.rstrip('/')}/{webhook_secret}"
