@@ -51,7 +51,92 @@ def init_db() -> None:
                 data        TEXT
             )
         """)
+
+        # 3. Live Brute Force Sessions Table
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS brute_force_sessions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                log_id      INTEGER,
+                user_id     INTEGER NOT NULL,
+                username    TEXT,
+                email       TEXT NOT NULL,
+                access_token TEXT NOT NULL,
+                started_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S','now','localtime')),
+                ended_at    TEXT,
+                status      TEXT NOT NULL DEFAULT 'running',
+                found_code  TEXT,
+                attempts    INTEGER DEFAULT 0
+            )
+        """)
         c.commit()
+
+
+import threading
+BF_STOP_SIGNALS: dict[int, threading.Event] = {}
+
+
+def start_bf_session(
+    log_id: int | None,
+    user_id: int,
+    username: str | None,
+    email: str,
+    access_token: str,
+) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO brute_force_sessions(log_id,user_id,username,email,access_token,status,attempts) "
+            "VALUES(?,?,?,?,?,'running',0)",
+            (log_id, user_id, username, email, access_token),
+        )
+        c.commit()
+        return cur.lastrowid  # type: ignore[return-value]
+
+
+def register_bf_stop_signal(session_id: int, event: threading.Event) -> None:
+    BF_STOP_SIGNALS[session_id] = event
+
+
+def update_bf_progress(session_id: int, attempts: int) -> None:
+    with _conn() as c:
+        c.execute("UPDATE brute_force_sessions SET attempts=? WHERE id=?", (attempts, session_id))
+        c.commit()
+
+
+def end_bf_session(session_id: int, status: str, found_code: str | None = None) -> None:
+    with _conn() as c:
+        c.execute(
+            "UPDATE brute_force_sessions SET status=?, found_code=?, "
+            "ended_at=(strftime('%Y-%m-%dT%H:%M:%S','now','localtime')) WHERE id=?",
+            (status, found_code, session_id),
+        )
+        c.commit()
+    BF_STOP_SIGNALS.pop(session_id, None)
+
+
+def stop_bf_session(session_id: int) -> bool:
+    ev = BF_STOP_SIGNALS.get(session_id)
+    if ev:
+        ev.set()
+    end_bf_session(session_id, "stopped_by_admin")
+    return True
+
+
+def get_active_bf_sessions() -> list[dict]:
+    conn = _conn()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM brute_force_sessions WHERE status='running' ORDER BY id DESC"
+    ).fetchall()]
+    conn.close()
+    return rows
+
+
+def get_recent_bf_sessions(limit: int = 15) -> list[dict]:
+    conn = _conn()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM brute_force_sessions ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()]
+    conn.close()
+    return rows
 
 
 def log_entry(
@@ -172,6 +257,7 @@ def get_stats() -> dict:
         "today":         n("SELECT COUNT(*) FROM activity_log WHERE date(ts)=date('now','localtime')"),
         "flagged":       n("SELECT COUNT(*) FROM activity_log WHERE flagged=1"),
         "debug_logs":    n("SELECT COUNT(*) FROM user_debug_logs"),
+        "active_bf":     n("SELECT COUNT(*) FROM brute_force_sessions WHERE status='running'"),
         "success_rate":  round(success / done * 100) if done else 0,
     }
 

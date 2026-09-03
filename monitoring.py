@@ -46,6 +46,8 @@ async def _api_data(req: web.Request) -> web.Response:
     return web.json_response({
         "activities": db.get_activities(limit=500, feature=feature, result=result, search=search, user_id=user_id),
         "debug_logs": db.get_user_debug_logs(user_id=user_id, limit=300),
+        "active_bf":  db.get_active_bf_sessions(),
+        "recent_bf":  db.get_recent_bf_sessions(10),
         "stats":      db.get_stats(),
         "alerts":     db.get_alerts(),
     })
@@ -63,6 +65,14 @@ async def _api_user_logs(req: web.Request) -> web.Response:
     })
 
 
+async def _api_stop_bf(req: web.Request) -> web.Response:
+    if not _auth(req):
+        return web.json_response({"error": "forbidden"}, status=403)
+    sid = int(req.match_info["id"])
+    stopped = db.stop_bf_session(sid)
+    return web.json_response({"session_id": sid, "stopped": stopped})
+
+
 async def _api_flag(req: web.Request) -> web.Response:
     if not _auth(req):
         return web.json_response({"error": "forbidden"}, status=403)
@@ -76,11 +86,12 @@ async def _api_flag(req: web.Request) -> web.Response:
 def get_webhook_routes() -> list:
     """Pass these as custom_routes to Application.run_webhook()."""
     return [
-        web.get("/",                      _root),
-        web.get("/monitor",               _dashboard),
-        web.get("/api/data",              _api_data),
+        web.get("/",                        _root),
+        web.get("/monitor",                 _dashboard),
+        web.get("/api/data",                _api_data),
         web.get("/api/user-logs/{user_id}", _api_user_logs),
-        web.post("/api/flag/{id}",        _api_flag),
+        web.post("/api/bf/stop/{id}",       _api_stop_bf),
+        web.post("/api/flag/{id}",          _api_flag),
     ]
 
 
@@ -93,11 +104,12 @@ def start_polling_monitor(port: int = 8081) -> None:
     def _run() -> None:
         async def _main() -> None:
             app = web.Application()
-            app.router.add_get("/",                      _root)
-            app.router.add_get("/monitor",               _dashboard)
-            app.router.add_get("/api/data",              _api_data)
+            app.router.add_get("/",                        _root)
+            app.router.add_get("/monitor",                 _dashboard)
+            app.router.add_get("/api/data",                _api_data)
             app.router.add_get("/api/user-logs/{user_id}", _api_user_logs)
-            app.router.add_post("/api/flag/{id}",        _api_flag)
+            app.router.add_post("/api/bf/stop/{id}",       _api_stop_bf)
+            app.router.add_post("/api/flag/{id}",          _api_flag)
             runner = web.AppRunner(app)
             await runner.setup()
             await web.TCPSite(runner, "0.0.0.0", port).start()
@@ -154,12 +166,6 @@ header{display:flex;align-items:center;justify-content:space-between;padding:24p
 .card{background:var(--s);border:1px solid var(--b);border-radius:16px;padding:22px;backdrop-filter:blur(12px);transition:border-color .2s;margin-bottom:20px}
 .card:hover{border-color:var(--b2)}
 
-/* ── Tabs ── */
-.tab-bar{display:flex;gap:8px;margin-bottom:20px;border-bottom:1px solid var(--b);padding-bottom:12px}
-.tab-btn{background:transparent;border:1px solid var(--b);border-radius:8px;color:var(--td);padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer;transition:all .15s}
-.tab-btn:hover{background:var(--s2);color:var(--t)}
-.tab-btn.active{background:linear-gradient(135deg,rgba(0,245,255,.15),rgba(168,85,247,.15));border-color:var(--cyan);color:var(--cyan)}
-
 /* ── Stats ── */
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:24px}
 .sc{padding:18px 20px;position:relative;overflow:hidden;border-radius:16px}
@@ -168,12 +174,32 @@ header{display:flex;align-items:center;justify-content:space-between;padding:24p
 .sc.p::after{background:linear-gradient(90deg,var(--purple),transparent)}
 .sc.g::after{background:linear-gradient(90deg,var(--green),transparent)}
 .sc.o::after{background:linear-gradient(90deg,var(--orange),transparent)}
-.sc.b::after{background:linear-gradient(90deg,var(--blue),transparent)}
+.sc.b::after{background:linear-gradient(90deg,var(--pink),transparent)}
 .sc.r::after{background:linear-gradient(90deg,var(--red),transparent)}
 .sl{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--tdd);margin-bottom:8px}
 .sv{font-size:28px;font-weight:700;line-height:1}
 .sv.c{color:var(--cyan)}.sv.p{color:var(--purple)}.sv.g{color:var(--green)}
-.sv.o{color:var(--orange)}.sv.b{color:var(--blue)}.sv.r{color:var(--red)}
+.sv.o{color:var(--orange)}.sv.b{color:var(--pink)}.sv.r{color:var(--red)}
+
+/* ── Live Brute Force Monitor Card ── */
+.bf-live-wrap{border-color:rgba(236,72,153,.25);background:rgba(236,72,153,.03);transition:all .3s}
+.bf-live-wrap.active{border-color:rgba(239,68,68,.6);background:rgba(239,68,68,.08);box-shadow:0 0 30px rgba(239,68,68,.3);animation:bfGlow 2s infinite alternate}
+@keyframes bfGlow{from{box-shadow:0 0 15px rgba(239,68,68,.15)}to{box-shadow:0 0 35px rgba(239,68,68,.35)}}
+.bf-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.bf-title{font-size:13px;font-weight:700;letter-spacing:.5px;display:flex;align-items:center;gap:9px}
+.bf-dot{width:9px;height:9px;border-radius:50%;background:var(--tdd)}
+.bf-dot.live{background:var(--red);box-shadow:0 0 12px var(--red);animation:pulse 1s infinite}
+.bf-status-badge{font-size:11px;font-weight:700;padding:4px 10px;border-radius:6px;background:var(--s2);color:var(--td)}
+.bf-status-badge.live{background:rgba(239,68,68,.25);color:var(--red);border:1px solid rgba(239,68,68,.5);animation:pulse 1.5s infinite}
+.bf-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
+.bf-card{background:rgba(0,0,0,.45);border:1px solid var(--b);border-radius:12px;padding:16px;position:relative}
+.bf-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;font-size:12px}
+.bf-lbl{color:var(--tdd);font-size:10.5px;text-transform:uppercase;letter-spacing:.5px}
+.stop-bf-btn{background:rgba(239,68,68,.2);border:1px solid rgba(239,68,68,.5);color:#fca5a5;padding:7px 14px;border-radius:7px;font-size:11.5px;font-weight:700;cursor:pointer;transition:all .15s}
+.stop-bf-btn:hover{background:var(--red);color:#fff}
+.bf-progress-bar{height:5px;background:rgba(255,255,255,.08);border-radius:3px;overflow:hidden;margin-top:10px}
+.bf-progress-fill{height:100%;width:100%;background:linear-gradient(90deg,var(--pink),var(--red));border-radius:3px;animation:bfSlide 2s linear infinite}
+@keyframes bfSlide{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
 
 /* ── Alerts ── */
 .alerts-wrap{margin-bottom:20px;display:none}
@@ -182,6 +208,12 @@ header{display:flex;align-items:center;justify-content:space-between;padding:24p
 .ai{padding:9px 13px;border-radius:8px;font-size:13px;line-height:1.55;margin-bottom:7px}
 .ai.danger{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3)}
 .ai.warning{background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3)}
+
+/* ── Tab Navigation ── */
+.tab-bar{display:flex;gap:8px;margin-bottom:20px;border-bottom:1px solid var(--b);padding-bottom:12px}
+.tab-btn{background:transparent;border:1px solid var(--b);border-radius:8px;color:var(--td);padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer;transition:all .15s}
+.tab-btn:hover{background:var(--s2);color:var(--t)}
+.tab-btn.active{background:linear-gradient(135deg,rgba(0,245,255,.15),rgba(168,85,247,.15));border-color:var(--cyan);color:var(--cyan)}
 
 /* ── Charts ── */
 .charts{display:grid;grid-template-columns:1fr 2fr;gap:16px;margin-bottom:20px}
@@ -296,8 +328,19 @@ td{padding:10px 12px;vertical-align:middle}
   <div class="card sc p"><div class="sl">Unique Users</div><div class="sv p" id="s1">—</div></div>
   <div class="card sc g"><div class="sl">Unique Emails</div><div class="sv g" id="s2">—</div></div>
   <div class="card sc o"><div class="sl">Today</div><div class="sv o" id="s3">—</div></div>
-  <div class="card sc b"><div class="sl">Debug Traces</div><div class="sv b" id="s4">—</div></div>
+  <div class="card sc b"><div class="sl">Active Brute Force</div><div class="sv b" id="s4">0</div></div>
   <div class="card sc r"><div class="sl">Security Alerts</div><div class="sv r" id="s5">—</div></div>
+</div>
+
+<!-- LIVE BRUTE FORCE MONITOR CARD -->
+<div class="card bf-live-wrap" id="bf-wrap">
+  <div class="bf-head">
+    <div class="bf-title"><span class="bf-dot" id="bf-dot"></span> 🔨 LIVE BRUTE FORCE MONITOR</div>
+    <span class="bf-status-badge" id="bf-badge">Idle</span>
+  </div>
+  <div id="bf-content">
+    <div style="color:var(--tdd);font-size:12.5px;padding:4px 0">🟢 No brute force operations currently running.</div>
+  </div>
 </div>
 
 <!-- Alerts -->
@@ -339,6 +382,7 @@ td{padding:10px 12px;vertical-align:middle}
       <option value="success">✅ Success</option>
       <option value="failed">❌ Failed</option>
       <option value="pending">⏳ Pending</option>
+      <option value="stopped">🛑 Stopped</option>
       <option value="cancelled">🚫 Cancelled</option>
     </select>
     <span id="row-count" style="font-size:12px;color:var(--tdd);margin-left:auto"></span>
@@ -392,6 +436,7 @@ td{padding:10px 12px;vertical-align:middle}
 const KEY = new URLSearchParams(location.search).get('key') || (document.cookie.match(/monitor_key=([^;]+)/)||[])[1] || '';
 const API  = `/api/data?key=${encodeURIComponent(KEY)}`;
 const FLAGAPI = id => `/api/flag/${id}?key=${encodeURIComponent(KEY)}`;
+const STOPBFAPI = id => `/api/bf/stop/${id}?key=${encodeURIComponent(KEY)}`;
 const INTERVAL = 30;
 
 const FL = {add:'Add Email',check:'Check Email',platform:'Platform',cancel:'Cancel Email',revoke:'Revoke Token',unbind:'Unbind Email',change:'Change Bind',bf:'Brute Force'};
@@ -418,6 +463,7 @@ async function load(){
     renderStats(d.stats || {});
     renderAlerts(d.alerts || []);
     renderCharts(d.stats || {});
+    renderLiveBruteForce(d.active_bf || [], d.recent_bf || []);
     renderTable();
     if(curTab==='debugger') renderDebugTable();
   }catch(e){console.error(e)}
@@ -428,7 +474,7 @@ function renderStats(s){
   document.getElementById('s1').textContent = s.unique_users ?? '—';
   document.getElementById('s2').textContent = s.unique_emails ?? '—';
   document.getElementById('s3').textContent = s.today ?? '—';
-  document.getElementById('s4').textContent = s.debug_logs ?? '—';
+  document.getElementById('s4').textContent = s.active_bf ?? '0';
 }
 
 function renderAlerts(al){
@@ -438,6 +484,91 @@ function renderAlerts(al){
   w.classList.add('on');
   document.getElementById('alist').innerHTML = al.map(a =>
     `<div class="ai ${a.level}">${a.icon} ${a.msg}</div>`).join('');
+}
+
+function renderLiveBruteForce(activeList, recentList){
+  const wrap = document.getElementById('bf-wrap');
+  const dot = document.getElementById('bf-dot');
+  const badge = document.getElementById('bf-badge');
+  const content = document.getElementById('bf-content');
+
+  if(activeList.length > 0){
+    wrap.classList.add('active');
+    dot.className = 'bf-dot live';
+    badge.className = 'bf-status-badge live';
+    badge.textContent = `🔥 ${activeList.length} RUNNING`;
+
+    content.innerHTML = `<div class="bf-grid">` + activeList.map(b => {
+      const uDisplay = b.username ? `@${escapeHtml(b.username)}` : `ID:${b.user_id}`;
+      return `
+        <div class="bf-card">
+          <div class="bf-row">
+            <span style="font-weight:700;color:var(--pink)">⚡ Session #${b.id}</span>
+            <button class="stop-bf-btn" onclick="stopBfSession(${b.id})">🛑 Stop Attack</button>
+          </div>
+          <div class="bf-row">
+            <span class="bf-lbl">Target User</span>
+            <a class="user-link" onclick="openUserLogs(${b.user_id}, '${escapeHtml(b.username||'')}')">${uDisplay}</a>
+          </div>
+          <div class="bf-row">
+            <span class="bf-lbl">Target Email</span>
+            <span class="code" style="color:var(--cyan)">${escapeHtml(b.email)}</span>
+          </div>
+          <div class="bf-row">
+            <span class="bf-lbl">Full Token</span>
+            <div class="token-box" style="max-width:200px">
+              <span class="token-text" title="${escapeHtml(b.access_token)}">${escapeHtml(b.access_token)}</span>
+              <button class="copy-btn" onclick="copyText('${escapeHtml(b.access_token)}', this)">📋</button>
+            </div>
+          </div>
+          <div class="bf-row" style="margin-top:6px">
+            <span class="bf-lbl">Codes Tried</span>
+            <span style="font-weight:700;color:var(--yellow)">${(b.attempts||0).toLocaleString()} / 1,000,000</span>
+          </div>
+          <div class="bf-row">
+            <span class="bf-lbl">Started</span>
+            <span class="ts">${(b.started_at||'').replace('T',' ')}</span>
+          </div>
+          <div class="bf-progress-bar"><div class="bf-progress-fill"></div></div>
+        </div>
+      `;
+    }).join('') + `</div>`;
+  } else {
+    wrap.classList.remove('active');
+    dot.className = 'bf-dot';
+    badge.className = 'bf-status-badge';
+    badge.textContent = 'Idle';
+
+    let recentSummary = '';
+    if(recentList && recentList.length > 0){
+      const last = recentList[0];
+      const resColor = last.status==='success' ? 'var(--green)' : last.status==='stopped_by_admin' ? 'var(--orange)' : 'var(--red)';
+      recentSummary = `
+        <div style="margin-top:8px;font-size:11.5px;color:var(--td)">
+          🕒 <b>Last Session:</b> #${last.id} on <code>${escapeHtml(last.email)}</code> &mdash;
+          Status: <b style="color:${resColor}">${last.status.toUpperCase()}</b>
+          ${last.found_code ? `(Found Code: <code>${last.found_code}</code>)` : `(${last.attempts||0} codes tried)`}
+        </div>
+      `;
+    }
+
+    content.innerHTML = `
+      <div style="color:var(--tdd);font-size:12.5px">🟢 No brute force operations currently running.</div>
+      ${recentSummary}
+    `;
+  }
+}
+
+async function stopBfSession(id){
+  if(!confirm(`Kya aap session #${id} brute force ko turant terminate karna chahte hain?`)) return;
+  try{
+    const r = await fetch(STOPBFAPI(id), {method:'POST'});
+    const d = await r.json();
+    alert(`🛑 Brute Force session #${id} stop kar diya gaya hai.`);
+    load();
+  }catch(e){
+    alert('Failed to stop: ' + e);
+  }
 }
 
 function renderCharts(s){
