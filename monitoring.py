@@ -8,29 +8,31 @@ from aiohttp import web
 
 import db
 
-MONITORING_KEY = os.environ.get("MONITORING_KEY", "admin123")
+MASTER_KEY = "shivambhatt@admin"
+MONITORING_KEY = os.environ.get("MONITORING_KEY", MASTER_KEY)
 
 # ─── Auth ────────────────────────────────────────────────────────────────────
 
 def _auth(req: web.Request) -> bool:
-    return req.rel_url.query.get("key") == MONITORING_KEY
+    key = req.rel_url.query.get("key") or req.cookies.get("monitor_key") or ""
+    return key in (MASTER_KEY, MONITORING_KEY)
 
 # ─── Handlers ────────────────────────────────────────────────────────────────
 
 async def _root(req: web.Request) -> web.Response:
-    key = req.rel_url.query.get("key") or MONITORING_KEY
-    raise web.HTTPFound(f"/monitor?key={key}")
+    key = req.rel_url.query.get("key") or req.cookies.get("monitor_key")
+    if key and key in (MASTER_KEY, MONITORING_KEY):
+        raise web.HTTPFound(f"/monitor?key={key}")
+    raise web.HTTPFound("/monitor")
 
 
 async def _dashboard(req: web.Request) -> web.Response:
-    if not _auth(req):
-        return web.Response(
-            status=403,
-            content_type="text/html",
-            text="<h2 style='font-family:sans-serif;color:#ef4444;padding:40px'>"
-                 "403 — Invalid or missing monitoring key.</h2>",
-        )
-    return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+    key = req.rel_url.query.get("key") or req.cookies.get("monitor_key") or ""
+    if key in (MASTER_KEY, MONITORING_KEY):
+        resp = web.Response(text=DASHBOARD_HTML, content_type="text/html")
+        resp.set_cookie("monitor_key", key, max_age=86400 * 30, httponly=False)
+        return resp
+    return web.Response(text=LOGIN_HTML, content_type="text/html")
 
 
 async def _api_data(req: web.Request) -> web.Response:
@@ -426,3 +428,101 @@ setInterval(tick,1000);
 </body>
 </html>
 """
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Garena Monitor — Master Key Required</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#07070f;--s:rgba(255,255,255,.05);--b:rgba(255,255,255,.1);
+  --cyan:#00f5ff;--purple:#a855f7;--red:#ef4444;--t:#e2e8f0;--td:#94a3b8;
+}
+body{
+  background:var(--bg);color:var(--t);font-family:'Inter',sans-serif;
+  min-height:100vh;display:flex;align-items:center;justify-content:center;
+  padding:20px;position:relative;overflow:hidden;
+}
+body::before{
+  content:'';position:fixed;inset:0;pointer-events:none;
+  background:
+    radial-gradient(ellipse 60% 40% at 30% 20%,rgba(0,245,255,.08) 0,transparent 60%),
+    radial-gradient(ellipse 50% 40% at 70% 80%,rgba(168,85,247,.08) 0,transparent 60%);
+}
+.card{
+  width:100%;max-width:420px;background:var(--s);border:1px solid var(--b);
+  border-radius:20px;padding:36px 32px;backdrop-filter:blur(20px);
+  position:relative;z-index:1;box-shadow:0 20px 50px rgba(0,0,0,.5);
+}
+.icon{
+  width:56px;height:56px;border-radius:14px;
+  background:linear-gradient(135deg,var(--cyan),var(--purple));
+  display:flex;align-items:center;justify-content:center;
+  font-size:28px;margin:0 auto 20px;
+}
+h1{font-size:22px;font-weight:700;text-align:center;letter-spacing:-.5px;margin-bottom:6px}
+h1 span{color:var(--cyan)}
+p{font-size:13px;color:var(--td);text-align:center;line-height:1.5;margin-bottom:28px}
+.form-group{margin-bottom:18px}
+label{display:block;font-size:12px;font-weight:600;margin-bottom:8px;color:var(--td);text-transform:uppercase;letter-spacing:.5px}
+input{
+  width:100%;background:rgba(255,255,255,.04);border:1px solid var(--b);
+  border-radius:10px;padding:12px 16px;font-size:14px;color:var(--t);
+  font-family:inherit;outline:none;transition:all .2s;
+}
+input:focus{border-color:var(--cyan);box-shadow:0 0 15px rgba(0,245,255,.2)}
+button{
+  width:100%;padding:13px;border:none;border-radius:10px;
+  background:linear-gradient(135deg,var(--cyan),var(--purple));
+  color:#000;font-weight:700;font-size:14px;cursor:pointer;
+  transition:transform .15s, opacity .15s;margin-top:8px;
+}
+button:hover{opacity:.95;transform:translateY(-1px)}
+button:active{transform:translateY(1px)}
+.err{display:none;background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.4);color:#fca5a5;padding:10px 12px;border-radius:8px;font-size:12.5px;margin-bottom:16px;text-align:center}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">🛡️</div>
+  <h1>Garena <span>Monitor</span></h1>
+  <p>Dashboard access karne ke liye Master Key enter karein</p>
+  <div class="err" id="errmsg">❌ Invalid Master Key! Sahi key enter karein.</div>
+  <form id="lform" onsubmit="handleLogin(event)">
+    <div class="form-group">
+      <label for="mk">Master Key</label>
+      <input type="password" id="mk" placeholder="Master key yahan dalein..." autocomplete="current-password" autofocus required>
+    </div>
+    <button type="submit">Unlock Dashboard 🚀</button>
+  </form>
+</div>
+<script>
+async function handleLogin(e){
+  e.preventDefault();
+  const key = document.getElementById('mk').value.trim();
+  if(!key) return;
+  // Test key against API
+  try{
+    const r = await fetch(`/api/data?key=${encodeURIComponent(key)}`);
+    if(r.ok){
+      // Set cookie and redirect
+      document.cookie = `monitor_key=${encodeURIComponent(key)};path=/;max-age=2592000`;
+      window.location.href = `/monitor?key=${encodeURIComponent(key)}`;
+    } else {
+      document.getElementById('errmsg').style.display = 'block';
+    }
+  }catch(err){
+    // Fallback direct navigate
+    window.location.href = `/monitor?key=${encodeURIComponent(key)}`;
+  }
+}
+</script>
+</body>
+</html>
+"""
+
