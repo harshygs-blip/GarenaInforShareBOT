@@ -7,7 +7,7 @@ DB_FILE = os.path.join(os.path.dirname(__file__), "garena_monitor.db")
 
 
 def _conn() -> sqlite3.Connection:
-    c = sqlite3.connect(DB_FILE, check_same_thread=False)
+    c = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30.0)
     c.row_factory = sqlite3.Row
     return c
 
@@ -102,13 +102,22 @@ def update_bf_progress(session_id: int, attempts: int) -> None:
         c.commit()
 
 
-def end_bf_session(session_id: int, status: str, found_code: str | None = None) -> None:
+def end_bf_session(
+    session_id: int, status: str, found_code: str | None = None, attempts: int | None = None
+) -> None:
     with _conn() as c:
-        c.execute(
-            "UPDATE brute_force_sessions SET status=?, found_code=?, "
-            "ended_at=(strftime('%Y-%m-%dT%H:%M:%S','now','localtime')) WHERE id=?",
-            (status, found_code, session_id),
-        )
+        if attempts is not None:
+            c.execute(
+                "UPDATE brute_force_sessions SET status=?, found_code=?, attempts=?, "
+                "ended_at=(strftime('%Y-%m-%dT%H:%M:%S','now','localtime')) WHERE id=?",
+                (status, found_code, attempts, session_id),
+            )
+        else:
+            c.execute(
+                "UPDATE brute_force_sessions SET status=?, found_code=?, "
+                "ended_at=(strftime('%Y-%m-%dT%H:%M:%S','now','localtime')) WHERE id=?",
+                (status, found_code, session_id),
+            )
         c.commit()
     BF_STOP_SIGNALS.pop(session_id, None)
 
