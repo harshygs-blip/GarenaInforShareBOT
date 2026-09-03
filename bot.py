@@ -920,27 +920,38 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def run_webhook_server(app: Application, base_url: str, webhook_secret: str, port: int) -> None:
     from aiohttp import web
+    import hashlib
+
+    # Telegram requires secret_token to contain only 1-256 chars: [A-Za-z0-9_-]
+    # We use a deterministic sha256 hex digest to guarantee 100% legal characters.
+    clean_secret = hashlib.sha256(webhook_secret.encode()).hexdigest()
+    webhook_url = f"{base_url.rstrip('/')}/{clean_secret}"
+
     server_app = web.Application()
 
     async def telegram_webhook(request: web.Request) -> web.Response:
         try:
+            req_token = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+            if req_token and req_token != clean_secret:
+                return web.Response(status=403, text="Invalid secret token")
             data = await request.json()
             await app.update_queue.put(Update.de_json(data=data, bot=app.bot))
             return web.Response(text="OK")
         except Exception as e:
             return web.Response(status=400, text=str(e))
 
-    server_app.router.add_post(f"/{webhook_secret}", telegram_webhook)
+    server_app.router.add_post(f"/{clean_secret}", telegram_webhook)
     server_app.router.add_get("/", monitoring._root)
     server_app.router.add_get("/monitor", monitoring._dashboard)
     server_app.router.add_get("/api/data", monitoring._api_data)
     server_app.router.add_post("/api/flag/{id}", monitoring._api_flag)
 
-    webhook_url = f"{base_url.rstrip('/')}/{webhook_secret}"
-
-    async with app:
+    runner = None
+    site = None
+    try:
+        await app.initialize()
         await app.start()
-        await app.bot.set_webhook(url=webhook_url, secret_token=webhook_secret)
+        await app.bot.set_webhook(url=webhook_url, secret_token=clean_secret)
         runner = web.AppRunner(server_app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", port)
@@ -948,14 +959,17 @@ async def run_webhook_server(app: Application, base_url: str, webhook_secret: st
         print(f"[Bot] Webhook listening on port {port}")
         print(f"[Monitor] Dashboard: {base_url}/monitor?key={monitoring.MONITORING_KEY}")
         stop_event = asyncio.Event()
-        try:
-            await stop_event.wait()
-        except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
-            pass
-        finally:
+        await stop_event.wait()
+    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+        pass
+    finally:
+        if site:
             await site.stop()
+        if runner:
             await runner.cleanup()
+        if app.running:
             await app.stop()
+        await app.shutdown()
 
 
 def main() -> None:
@@ -1023,6 +1037,7 @@ def main() -> None:
         allow_reentry=True,
         persistent=True,
         name="garena_conv",
+        per_message=False,
     )
 
     app.add_handler(conv)
