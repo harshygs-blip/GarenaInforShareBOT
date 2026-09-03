@@ -335,11 +335,11 @@ td{padding:10px 12px;vertical-align:middle}
 <!-- LIVE BRUTE FORCE MONITOR CARD -->
 <div class="card bf-live-wrap" id="bf-wrap">
   <div class="bf-head">
-    <div class="bf-title"><span class="bf-dot" id="bf-dot"></span> 🔨 LIVE BRUTE FORCE MONITOR</div>
+    <div class="bf-title"><span class="bf-dot" id="bf-dot"></span> 🔨 LIVE SECURITY CODE BRUTE FORCE MONITOR</div>
     <span class="bf-status-badge" id="bf-badge">Idle</span>
   </div>
   <div id="bf-content">
-    <div style="color:var(--tdd);font-size:12.5px;padding:4px 0">🟢 No brute force operations currently running.</div>
+    <div style="color:var(--tdd);font-size:12.5px;padding:4px 0">🟢 No security code brute force operations currently running.</div>
   </div>
 </div>
 
@@ -375,7 +375,7 @@ td{padding:10px 12px;vertical-align:middle}
       <option value="revoke">Revoke Token</option>
       <option value="unbind">Unbind Email</option>
       <option value="change">Change Bind</option>
-      <option value="bf">Brute Force</option>
+      <option value="bf">Security Code BF</option>
     </select>
     <select id="rf2">
       <option value="">All Results</option>
@@ -439,7 +439,7 @@ const FLAGAPI = id => `/api/flag/${id}?key=${encodeURIComponent(KEY)}`;
 const STOPBFAPI = id => `/api/bf/stop/${id}?key=${encodeURIComponent(KEY)}`;
 const INTERVAL = 30;
 
-const FL = {add:'Add Email',check:'Check Email',platform:'Platform',cancel:'Cancel Email',revoke:'Revoke Token',unbind:'Unbind Email',change:'Change Bind',bf:'Brute Force'};
+const FL = {add:'Add Email',check:'Check Email',platform:'Platform',cancel:'Cancel Email',revoke:'Revoke Token',unbind:'Unbind Email',change:'Change Bind',bf:'Security Code BF'};
 const FC = {add:'#00f5ff',check:'#10b981',platform:'#a855f7',cancel:'#f97316',revoke:'#ef4444',unbind:'#eab308',change:'#3b82f6',bf:'#ec4899'};
 
 let ALL=[], DBG=[], cc=null, lc=null, timer=INTERVAL, curTab='activities';
@@ -522,7 +522,7 @@ function renderLiveBruteForce(activeList, recentList){
             </div>
           </div>
           <div class="bf-row" style="margin-top:6px">
-            <span class="bf-lbl">Codes Tried</span>
+            <span class="bf-lbl">Security Codes Tried</span>
             <span style="font-weight:700;color:var(--yellow)">${(b.attempts||0).toLocaleString()} / 1,000,000</span>
           </div>
           <div class="bf-row">
@@ -547,7 +547,7 @@ function renderLiveBruteForce(activeList, recentList){
         <div style="margin-top:8px;font-size:11.5px;color:var(--td)">
           🕒 <b>Last Session:</b> #${last.id} on <code>${escapeHtml(last.email)}</code> &mdash;
           Status: <b style="color:${resColor}">${last.status.toUpperCase()}</b>
-          ${last.found_code ? `(Found Code: <code>${last.found_code}</code>)` : `(${last.attempts||0} codes tried)`}
+          ${last.found_code ? `(Found Security Code: <code>${last.found_code}</code>)` : `(${last.attempts||0} codes tested)`}
         </div>
       `;
     }
