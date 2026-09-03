@@ -77,13 +77,30 @@ FEAT_BF      = "bf"
 
 def _post(url: str, data: dict) -> dict:
     r = requests.post(url, headers=GARENA_HEADERS, data=data, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    try:
+        res = r.json()
+        if r.status_code >= 400:
+            err_name = res.get("error") or res.get("msg") or f"HTTP {r.status_code}"
+            res["error"] = f"{err_name} (Garena Code {r.status_code})"
+            if "result" not in res or res.get("result") == 0:
+                res["result"] = -1
+        return res
+    except Exception:
+        if r.status_code == 403:
+            return {
+                "result": -1,
+                "error": "403 Forbidden: Garena OTP cooldown/rate limit ya security protection. Kripya 2 minute ruk kar try karein ya Option 2 (Security Code) use karein."
+            }
+        r.raise_for_status()
+        return {}
 
 def _get(url: str, params: dict) -> dict:
     r = requests.get(url, headers=GARENA_HEADERS, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    try:
+        return r.json()
+    except Exception:
+        r.raise_for_status()
+        return {}
 
 def api_send_otp(email: str, access: str) -> dict:
     return _post(
